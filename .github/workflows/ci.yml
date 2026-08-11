@@ -1,0 +1,60 @@
+# Checks run on every push. Both platforms, every time — a lint pass done on
+# only one of them has already let Linux-only warnings through unnoticed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel an in-flight run when the same branch is pushed again.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report both platforms even when one fails: knowing it breaks on Linux
+      # only, or on both, is the useful part.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup honours rust-toolchain.toml, which already pins the channel and
+      # asks for rustfmt and clippy.
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfontconfig1-dev
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # Warnings are errors: the project's standing rule is a clean build on
+      # both platforms.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked

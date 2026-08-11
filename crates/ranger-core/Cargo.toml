@@ -1,0 +1,20 @@
+[package]
+name = "ranger-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ranger core: config, i18n, XDG paths, logging, workspace model."
+publish = false   # internal crate (never published to crates.io)
+
+[dependencies]
+serde              = { workspace = true }
+toml               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror          = { workspace = true }
+image              = { workspace = true }
+dirs               = { workspace = true }
+trash              = { workspace = true }
+sysinfo            = { workspace = true }

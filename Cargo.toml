@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/ranger-core", "crates/ranger-gui"]
+
+[workspace.package]
+version      = "0.2.8"
+edition      = "2024"
+rust-version = "1.88"
+license      = "GPL-3.0-or-later"
+repository   = "https://github.com/GlitchAwakened/Ranger"
+
+[workspace.dependencies]
+# Keep the runtime and compiler on the same tested Slint release. The UI uses
+# dynamic GridLayout rows introduced after 1.13, so silently selecting an older
+# MSRV-compatible release would fail in the build script.
+slint              = "=1.16.1"
+slint-build        = "=1.16.1"
+serde              = { version = "1", features = ["derive"] }
+toml               = "0.9"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+thiserror          = "2"
+anyhow             = "1"
+notify             = "8"
+# 100% Rust image decoding (no C, no network) for previews.
+image              = { version = "0.25", default-features = false, features = [
+    "jpeg", "png", "gif", "webp", "bmp", "tiff", "tga", "hdr", "ico",
+] }
+
+# --- Cross-platform dependencies — all offline, checked by cargo-deny ---
+# Known cross-OS folders (XDG on Linux / %APPDATA% on Windows).
+dirs               = "6"
+# Cross-OS drives/volumes (the "Places" sidebar). We only keep the
+# disk feature (not the process/system scan → lighter).
+sysinfo            = { version = "0.36", default-features = false, features = ["disk"] }
+# Cross-OS trash (Recycle Bin / FreeDesktop).
+trash              = "5"
+# Opens with the default application.
+open               = "5"
+# Cross-OS clipboard (text). We keep the Wayland backend but drop
+# `image-data` (unneeded: we only copy text).
+arboard            = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# Wayland file clipboard: already a transitive of `arboard`, named
+# directly to publish/read the XDG/KDE MIME formats (no X11 support).
+wl-clipboard-rs    = "0.9"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true

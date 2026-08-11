@@ -1,0 +1,134 @@
+# Publishes the two portable executables when a version tag is pushed.
+#
+#   git tag v0.2.8 && git push origin v0.2.8
+#
+# The Linux binary is built INSIDE an Ubuntu 22.04 container rather than on the
+# runner itself. A binary links against the glibc it was built with and then
+# requires at least that version at run time, so building on a current runner
+# would produce something that refuses to start on Debian 12, Mint 21 and most
+# conservative distributions. Building against 2.35 keeps it running everywhere
+# from those up to the newest systems — a newer machine simply supplies its own,
+# patched glibc at run time.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux binary
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      # The image is bare: even git and curl have to be installed before
+      # checkout can run.
+      - name: Container dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfontconfig1-dev \
+            curl ca-certificates git
+
+      - uses: actions/checkout@v4
+
+      # The distribution's rustc is far too old; rustup gives the pinned
+      # toolchain from rust-toolchain.toml.
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --release --bin ranger --locked
+
+      # Proof the container did its job. Measured, not assumed: a version above
+      # 2.35 here means the binary escaped the container's glibc and would fail
+      # to start on the older distributions this job exists to support.
+      - name: Check the glibc floor
+        run: |
+          objdump -T target/release/ranger \
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -5
+          highest=$(objdump -T target/release/ranger \
+            | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+          echo "Highest required: $highest"
+          if [ "$(printf '%s\nGLIBC_2.35\n' "$highest" | sort -V | tail -1)" != "GLIBC_2.35" ]; then
+            echo "::error::$highest exceeds GLIBC_2.35 — the binary will not run on older distributions"
+            exit 1
+          fi
+
+      # A GitHub release asset is served as a bare file with no permission
+      # metadata: uploading the binary directly would silently drop its
+      # executable bit, unlike this workflow's own inter-job artifacts. tar
+      # preserves Unix permissions, so extracting the archive already leaves
+      # `ranger` executable — no `chmod` step for whoever downloads it. The
+      # icon rides along in the same download for a desktop entry / launcher.
+      - name: Package
+        run: |
+          mkdir -p dist
+          chmod +x target/release/ranger
+          cp crates/ranger-gui/assets/ranger.svg target/release/ranger.svg
+          tar -czf dist/ranger-linux-x86_64.tar.gz \
+            -C target/release ranger ranger.svg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ranger-linux-x86_64
+          path: dist/ranger-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows binary
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin ranger --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ranger-windows-x86_64
+          path: target/release/ranger.exe
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    # Only what the release needs: creating it, nothing else.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Flatten and give the files names that say what they are once
+      # downloaded, since a browser drops them straight into Downloads. The
+      # Linux side is already a named .tar.gz (built and permission-preserved
+      # in the `linux` job); only the Windows binary needs renaming here.
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          cp artifacts/ranger-linux-x86_64/ranger-linux-x86_64.tar.gz dist/
+          cp artifacts/ranger-windows-x86_64/ranger.exe dist/ranger-windows-x86_64.exe
+          ls -l dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            dist/ranger-linux-x86_64.tar.gz \
+            dist/ranger-windows-x86_64.exe
