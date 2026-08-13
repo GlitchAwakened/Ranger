@@ -294,8 +294,90 @@ pub fn try_open_image_gallery(path: &Path, extension: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Is `path` a program this desktop would refuse to start for us?
+///
+/// The executable bit alone is not enough: a FAT/NTFS/exFAT mount reports
+/// everything as `0777`, so an image copied from Windows would qualify. The
+/// same filter as the listing is applied — only a recognized binary/script, or
+/// a file of unrecognized type (a binary without an extension, common here).
+///
+/// `.desktop` is deliberately left out even though it looks executable: it is a
+/// launcher description, not a program, and only the desktop environment knows
+/// how to act on it. Running it as a script would do the wrong thing.
+#[cfg(not(windows))]
+fn is_launchable_program(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if extension.as_deref() == Some("desktop") {
+        return false;
+    }
+    if !ranger_core::fs::classify_kind(extension.as_deref(), false).can_be_program() {
+        return false;
+    }
+    has_exec_bit(path)
+}
+
+/// Executable bit set on a regular file. Follows links, like the listing does:
+/// a shortcut to a binary is launchable, and it is the target's bit that
+/// decides.
+#[cfg(not(windows))]
+fn has_exec_bit(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Is `path` a desktop launcher its owner has approved?
+///
+/// The executable bit is the same trust mark as for a native program, and the
+/// rule the KDE file manager applies: an entry can name any command behind any
+/// display name and icon, so one that has never been marked stays a text file.
+#[cfg(not(windows))]
+fn is_desktop_launcher(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("desktop"))
+        && has_exec_bit(path)
+}
+
 #[cfg(not(windows))]
 pub fn open_path(path: &Path) -> Result<()> {
+    // A launcher is acted upon, not opened. Asking the desktop to open one
+    // gives back its source text in an editor: KIO only runs an entry when the
+    // caller opted in, exactly as it does for a binary, so the same delegation
+    // has to be skipped. Ranger reads the entry itself and starts what it
+    // names.
+    if is_desktop_launcher(path) {
+        info!(path = %path.display(), "launch desktop entry");
+        return crate::openwith::launch_desktop_file(path);
+    }
+    // A program is started directly instead of being handed to the desktop.
+    //
+    // Handing it over does not work on KDE: the request reaches KIO's
+    // `OpenUrlJob`, which runs an executable only when the calling application
+    // asked for it through `setRunExecutables(true)`. Dolphin does; the
+    // `xdg-open` path does not, and the launch comes back refused with "For
+    // security reasons, launching executables is not allowed in this context."
+    // That flag belongs to the KDE-side API, so no argument passed to
+    // `xdg-open` can reach it — the delegation itself is what has to be
+    // skipped, and only for this case.
+    if is_launchable_program(path) {
+        info!(path = %path.display(), "run program directly");
+        // Its own folder, as if started from a terminal there, so a program
+        // reading a file next to itself finds it whatever folder Ranger was
+        // started from.
+        return spawn_detached_in(path, Vec::new(), false, path.parent());
+    }
     info!(path = %path.display(), "open with default app");
     open::that_detached(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))
 }
@@ -408,6 +490,13 @@ pub fn spawn_program(program: &Path, args: &[String]) -> Result<()> {
     spawn_detached(program, args.to_vec(), false)
 }
 
+/// [`spawn_program`] started in `cwd`, for a launcher that names the folder its
+/// application expects to run from (`Path=` in a desktop entry).
+#[cfg_attr(windows, allow(dead_code))]
+pub fn spawn_program_in(program: &Path, args: &[String], cwd: Option<&Path>) -> Result<()> {
+    spawn_detached_in(program, args.to_vec(), false, cwd)
+}
+
 /// Launches an opener on a folder from a command pinned to the view's
 /// background, e.g. "Git Bash here". In this context, `{dir}` and `{file}`
 /// both equal the current folder (in `TagContext::from_path`, `{dir}` would be
@@ -471,6 +560,18 @@ pub fn spawn_new_instance(dir: &Path, at: Option<(i32, i32)>, tab_bar_mode: u8) 
 /// UAC prompt. On other OSes the flag is ignored (elevating a graphical
 /// app isn't a standard mechanism there): normal launch.
 fn spawn_detached(program: &Path, argv: Vec<String>, elevated: bool) -> Result<()> {
+    spawn_detached_in(program, argv, elevated, None)
+}
+
+/// [`spawn_detached`] with a working directory for the child. Split out rather
+/// than added to every call site, which has no folder to impose and passes
+/// `None`.
+fn spawn_detached_in(
+    program: &Path,
+    argv: Vec<String>,
+    elevated: bool,
+    cwd: Option<&Path>,
+) -> Result<()> {
     info!(program = %program.display(), argc = argv.len(), elevated, "run opener");
     #[cfg(windows)]
     if elevated {
@@ -481,6 +582,15 @@ fn spawn_detached(program: &Path, argv: Vec<String>, elevated: bool) -> Result<(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    // Startup-notification tokens are valid for ONE launch: the desktop hands
+    // one to Ranger, and a child inheriting it would have its own startup
+    // credited to Ranger's window. Unset everywhere — they do not exist on
+    // Windows, where removing them is a no-op.
+    cmd.env_remove("DESKTOP_STARTUP_ID")
+        .env_remove("XDG_ACTIVATION_TOKEN");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -917,7 +1027,7 @@ pub fn open_terminal(path: &Path) -> Result<()> {
 // ----- Internal helpers (Linux only) -----
 
 #[cfg(not(windows))]
-fn pick_terminal() -> Option<String> {
+pub(crate) fn pick_terminal() -> Option<String> {
     if let Ok(t) = std::env::var("TERMINAL") {
         if !t.is_empty() && which(&t) {
             return Some(t);
@@ -1299,5 +1409,83 @@ mod terminal_tests {
         assert_eq!(cmd.get_program(), OsStr::new("cmd.exe"));
         assert_eq!(cmd.get_args().count(), 0);
         assert_eq!(cmd.get_current_dir(), Some(cwd));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod program_tests {
+    use super::is_launchable_program;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ranger-launchable-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn only_real_programs_bypass_the_desktop_opener() {
+        let dir = scratch();
+
+        // A binary without an extension with its bit set: the everyday case
+        // this bypass exists for.
+        assert!(is_launchable_program(&write(&dir, "blender", 0o755)));
+        assert!(is_launchable_program(&write(&dir, "run.sh", 0o755)));
+
+        // Same file without the bit: it is not a program, the desktop opener
+        // stays in charge of finding it an editor.
+        assert!(!is_launchable_program(&write(&dir, "notes", 0o644)));
+
+        // A data file on a FAT/NTFS mount reports 0777. Executing it would be
+        // absurd, so the type is what decides, not the bit.
+        for data in ["photo.jpg", "clip.mp4", "report.pdf", "archive.zip"] {
+            assert!(
+                !is_launchable_program(&write(&dir, data, 0o777)),
+                "{data} must never be run"
+            );
+        }
+
+        // A launcher description, not a program: only the desktop knows how to
+        // act on it, so it keeps going through the normal opener.
+        assert!(!is_launchable_program(&write(&dir, "app.desktop", 0o755)));
+
+        // A folder is never a program, whatever it is called.
+        let folder = dir.join("tools.sh");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(!is_launchable_program(&folder));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_link_is_judged_on_the_binary_it_points_at() {
+        let dir = scratch();
+        let real = write(&dir, "engine", 0o755);
+        let link = dir.join("engine-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(is_launchable_program(&link));
+
+        // A link to something that is not executable stays a plain document.
+        let plain = write(&dir, "readme", 0o644);
+        let plain_link = dir.join("readme-link");
+        std::os::unix::fs::symlink(&plain, &plain_link).unwrap();
+        assert!(!is_launchable_program(&plain_link));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

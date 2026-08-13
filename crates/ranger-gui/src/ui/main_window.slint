@@ -1483,6 +1483,39 @@ component FlyoutCloseTimer inherits Rectangle {
     }
 }
 
+// Auto-scrolls a scroll frame while a drag hovers near its top or bottom edge,
+// so a drop target sitting off-screen can be reached without releasing the drag.
+// Bind `viewport-y` two-way to the target ScrollView/Flickable; the timer only
+// nudges it within [min-vy, 0]. Inputs are in the window's absolute frame:
+// `cursor-y - frame-y` is the pointer's offset inside the visible area. Shared
+// by the file list and the favorites tree so both drag-scroll with the same feel.
+component DragEdgeScroller inherits Rectangle {
+    in property <bool> active;          // a drag is in progress over this frame
+    in property <length> cursor-y;      // absolute pointer Y
+    in property <length> frame-y;       // absolute Y of the visible frame's top
+    in property <length> frame-h;       // visible frame height
+    in property <length> min-vy;        // most-negative viewport-y (0 if it all fits)
+    in-out property <length> viewport-y;
+    // Edge band that arms the scroll, and the per-tick step.
+    property <length> edge: 30px;
+    property <length> step: 15px;
+    width: 0px;
+    height: 0px;
+    Timer {
+        interval: 16ms;
+        running: root.active;
+        triggered => {
+            let top: length = root.cursor-y - root.frame-y;
+            if (top >= 0px && top < root.edge && root.viewport-y < 0px) {
+                root.viewport-y = min(0px, root.viewport-y + root.step);
+            } else if (top > root.frame-h - root.edge && top <= root.frame-h
+                    && root.viewport-y > root.min-vy) {
+                root.viewport-y = max(root.min-vy, root.viewport-y - root.step);
+            }
+        }
+    }
+}
+
 component MenuItem inherits Rectangle {
     callback clicked();
     in property <string> label;
@@ -4574,23 +4607,18 @@ component PanelComponent inherits Rectangle {
                 }
             }
 
-            // Auto-scroll during a FILE DRAG when the cursor nears the
-            // top/bottom edge of the body → allows reaching an off-screen folder;
-            // `drag-folder-row` follows the scroll, so the target updates on its
-            // own. Active only on the hovered panel (`file-drag-over`).
-            Timer {
-                interval: 16ms;
-                running: root.file-drag-active && root.file-drag-over;
-                triggered => {
-                    if (root.drag-y-in-body >= 0px && root.drag-y-in-body < 30px
-                            && rows-scroll.viewport-y < 0px) {
-                        rows-scroll.viewport-y = min(0px, rows-scroll.viewport-y + 15px);
-                    } else if (root.drag-y-in-body > list-area.height - 30px
-                            && root.drag-y-in-body <= list-area.height
-                            && rows-scroll.viewport-y > root.rb-min-vy) {
-                        rows-scroll.viewport-y = max(root.rb-min-vy, rows-scroll.viewport-y - 15px);
-                    }
-                }
+            // Auto-scroll during a FILE DRAG when the cursor nears the top/bottom
+            // edge of the body → reaches an off-screen folder; `drag-folder-row`
+            // follows the scroll, so the target updates on its own. Active only on
+            // the hovered panel. `list-area` is the unscrolled body frame, so
+            // `file-drag-abs-y - list-area.y` is the in-body offset the edges use.
+            DragEdgeScroller {
+                active: root.file-drag-active && root.file-drag-over;
+                cursor-y: root.file-drag-abs-y;
+                frame-y: list-area.absolute-position.y;
+                frame-h: list-area.height;
+                min-vy: root.rb-min-vy;
+                viewport-y <=> rows-scroll.viewport-y;
             }
 
             // Auto-scroll on middle-click held down (browser/PDF style):
@@ -5762,22 +5790,41 @@ component Sidebar inherits Rectangle {
             drag-moved(section, x, y) => { root.section-drag-moved(section, x, y); }
             drag-dropped(section, x, y) => { root.section-drag-dropped(section, x, y); }
         }
-        for p in root.places : VerticalLayout {
-            padding: 0px;
-            spacing: 0px;
-            if !root.collapsed : HorizontalLayout {
-                padding-left: 6px;
-                padding-right: 6px;
-                padding-top: 2px;
-                SidebarItem {
-                    label: p.kind == 1 ? root.strings.sidebar-home
-                        : p.kind == 3 ? root.strings.sidebar-trash
-                        : (p.kind == 2 && p.label == "") ? root.strings.sidebar-root
-                        : p.label;
-                    kind: p.kind;
-                    clicked => { root.place-clicked(p.path, p.kind); }
-                    middle-clicked => { root.place-middle-clicked(p.path, p.kind); }
-                    right-clicked(x, y) => { root.place-right-clicked(p.path, p.kind, p.removable, p.device, x, y); }
+        // The items scroll on their own. Without this, a long list claims its
+        // full height from the panel's layout and pushes whatever follows past
+        // the bottom edge, out of reach — there was no way to scroll to it.
+        // `min-height: 0` is what lets the layout shrink the list instead;
+        // collapsing then zeroes the height rather than dropping the element,
+        // the same way the Favorites tree does it.
+        places-scroll := ScrollView {
+            vertical-stretch: 1;
+            visible: !root.collapsed;
+            min-height: 0px;
+            // Never taller than its own content, so the next section follows
+            // immediately instead of hanging below an empty gap. Slint
+            // geometry: item 30px + 2px of top padding.
+            max-height: root.collapsed ? 0px : root.places.length * 32px;
+            // Content height stated explicitly, for the reason given on the
+            // Favorites tree: a view told nothing about its content cannot
+            // know it has anything to scroll to.
+            viewport-height: max(self.height, root.places.length * 32px);
+            VerticalLayout {
+                padding: 0px;
+                spacing: 0px;
+                for p in root.places : HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    padding-top: 2px;
+                    SidebarItem {
+                        label: p.kind == 1 ? root.strings.sidebar-home
+                            : p.kind == 3 ? root.strings.sidebar-trash
+                            : (p.kind == 2 && p.label == "") ? root.strings.sidebar-root
+                            : p.label;
+                        kind: p.kind;
+                        clicked => { root.place-clicked(p.path, p.kind); }
+                        middle-clicked => { root.place-middle-clicked(p.path, p.kind); }
+                        right-clicked(x, y) => { root.place-right-clicked(p.path, p.kind, p.removable, p.device, x, y); }
+                    }
                 }
             }
         }
@@ -5973,6 +6020,10 @@ component FavPanel inherits Rectangle {
     property <bool> drag-on: root.tab-drag-active || root.file-drag-active;
     property <length> drag-ax: root.tab-drag-active ? root.tab-drag-abs-x : root.file-drag-abs-x;
     property <length> drag-ay: root.tab-drag-active ? root.tab-drag-abs-y : root.file-drag-abs-y;
+    // Absolute cursor Y captured continuously during an INTERNAL reorder drag
+    // (a file/tab drag carries its own `drag-ay`). Feeds the edge auto-scroll so
+    // an off-screen target row can be reached without releasing the drag.
+    property <length> reorder-cursor-y;
     // Index of the row hovered by the drag (uniform pitch 30 + 1px = 31px), or
     // -1. CRITICAL (→): every `absolute-position` read is CONFINED
     // to the "drag active" branch of the ternary → never evaluated outside a drag (the
@@ -6066,6 +6117,16 @@ component FavPanel inherits Rectangle {
             // FavPanel can shrink down to just its header when collapsed.
             min-height: 0px;
             max-height: root.section-collapsed ? 0px : 100000px;
+            // The content height, stated rather than inferred. `content-rect`
+            // is a plain Rectangle pinned to the visible height, so nothing
+            // would tell the view its rows go further down: the tree simply got
+            // clipped at the bottom edge, with no scrollbar and no way to
+            // reach the last favourites. Same approach as the file list, and
+            // the same geometry the hit-test below already assumes: row 30px +
+            // 1px gap = 31, list padding 11, empty state 132.
+            viewport-height: max(
+                self.height,
+                root.nodes.length == 0 ? 132px : 11px + root.nodes.length * 31px);
             // Container filled to AT LEAST the visible height → the "dead"
             // area below the list stays clickable (left click = closes menus).
             content-rect := Rectangle {
@@ -6119,12 +6180,32 @@ component FavPanel inherits Rectangle {
                     activate => { root.row-activate(n.id); }
                     middle-clicked => { root.row-middle(n.id); }
                     right-clicked(x, y) => { root.row-context(n.id, n.is-container, n.label, x, y); }
-                    drag-move(ri, cy, rt) => { root.row-drag-move(ri, cy, rt); }
+                    drag-move(ri, cy, rt) => { root.reorder-cursor-y = cy; root.row-drag-move(ri, cy, rt); }
                     drag-drop(ri, cy, rt) => { root.row-drag-drop(ri, cy, rt); }
                 }
             }
             }   // closes content-rect
         }
+    }
+
+    // Edge auto-scroll while a drag hovers the tree: an internal reorder (its
+    // cursor Y flows through `reorder-cursor-y`) or a tab/file drag (`drag-ay`,
+    // gated to the tree's X span so a drag over the file view never scrolls it).
+    // The pastille (`hover-row`) is reactive to `viewport-y`, so it follows the
+    // scroll onto the newly revealed containers. Frame reads target the ScrollView
+    // itself (unscrolled), the same safe read as `hover-row`.
+    DragEdgeScroller {
+        active: root.drag-active
+            || (root.drag-on
+                && root.drag-ax >= fav-scroll.absolute-position.x
+                && root.drag-ax <= fav-scroll.absolute-position.x + fav-scroll.width);
+        cursor-y: root.drag-active ? root.reorder-cursor-y : root.drag-ay;
+        frame-y: fav-scroll.absolute-position.y;
+        frame-h: fav-scroll.height;
+        min-vy: fav-scroll.viewport-height > fav-scroll.height
+            ? -(fav-scroll.viewport-height - fav-scroll.height)
+            : 0px;
+        viewport-y <=> fav-scroll.viewport-y;
     }
 }
 
@@ -6916,6 +6997,10 @@ export component MainWindow inherits Window {
     // every keystroke; the bridge sets `rename-conflict` if the name is already
     // taken at the same level (or invalid). Blocks confirmation.
     in-out property <bool> rename-conflict: false;
+    // Already-translated reason the name is refused ("" when it is fine).
+    // Filled by the bridge, which alone knows whether the name is taken or
+    // simply unusable on this filesystem.
+    in-out property <string> rename-name-error: "";
     // Replaceable conflict, file↔file only. Distinguishes a real duplicate
     // from an invalid name or a conflict involving a folder.
     in-out property <bool> rename-replace-available: false;
@@ -6939,6 +7024,9 @@ export component MainWindow inherits Window {
     // Shortcuts/links keep their own specific rules.
     in-out property <bool> create-name-valid: false;
     in-out property <bool> create-conflict: false;
+    // Already-translated reason the name is refused ("" when it is fine), see
+    // `rename-name-error`.
+    in-out property <string> create-name-error: "";
     // Target of a shortcut (mode 2): pointed-to path, typed or chosen via Browse.
     in-out property <string> create-target;
     // Shortcut popup tab: true = target a FOLDER, false = a
@@ -11444,11 +11532,13 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
-                // "Name already taken" warning (reuses the paste-conflict label).
+                // Why the name is refused: already taken, or unusable on this
+                // filesystem. The bridge decides and translates.
                 Text {
-                    text: root.rename-conflict ? root.strings.paste-conflict-taken : " ";
+                    text: root.rename-name-error == "" ? " " : root.rename-name-error;
                     color: Tokens.danger;
                     font-size: 12px;
+                    wrap: word-wrap;
                 }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalBox {
@@ -11537,9 +11627,10 @@ export component MainWindow inherits Window {
                     }
                 }
                 if root.create-kind == 0 || root.create-kind == 1 : Text {
-                    text: root.create-conflict ? root.strings.paste-conflict-taken : " ";
+                    text: root.create-name-error == "" ? " " : root.create-name-error;
                     color: Tokens.danger;
                     font-size: 12px;
+                    wrap: word-wrap;
                 }
                 // Shortcut mode only. Two tabs, Folder / File:
                 // they determine the type of "Browse…" picker (folder vs

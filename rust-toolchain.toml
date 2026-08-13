@@ -1,4 +1,12 @@
+# Exact version, not "stable". The CI treats warnings as errors, and a
+# floating channel means the runners pick up a newer compiler than the
+# development machine as soon as one is released: a Clippy lint added in the
+# meantime then fails a build that passed locally minutes earlier. Pinning
+# makes both sides identical by construction.
+#
+# Raising it is a deliberate step: bump the version here, run the full check
+# on both platforms, and commit that on its own.
 [toolchain]
-channel    = "stable"
+channel    = "1.97.1"
 components = ["rustfmt", "clippy"]
 profile    = "minimal"

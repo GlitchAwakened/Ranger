@@ -39,8 +39,10 @@ pub enum OpStatus {
 /// Windows `MAIN_SEPARATOR` is `\`, but `/` is also a valid separator there
 /// → testing only `MAIN_SEPARATOR` would let `foo/bar` through (a move).
 pub fn rename_in_place(from: &Path, new_name: &str) -> Result<PathBuf> {
-    if !is_valid_entry_name(new_name) {
-        return Err(Error::Workspace(format!("invalid new name: {new_name:?}")));
+    if let Err(reason) = check_file_name(new_name) {
+        return Err(Error::Workspace(format!(
+            "invalid new name: {new_name:?} ({reason:?})"
+        )));
     }
     let parent = from
         .parent()
@@ -59,8 +61,10 @@ pub fn rename_in_place(from: &Path, new_name: &str) -> Result<PathBuf> {
 /// `MoveFileExW` on Windows), never the dangerous `remove_file` then `rename`
 /// sequence.
 pub fn rename_in_place_replacing_file(from: &Path, new_name: &str) -> Result<PathBuf> {
-    if !is_valid_entry_name(new_name) {
-        return Err(Error::Workspace(format!("invalid new name: {new_name:?}")));
+    if let Err(reason) = check_file_name(new_name) {
+        return Err(Error::Workspace(format!(
+            "invalid new name: {new_name:?} ({reason:?})"
+        )));
     }
     let parent = from
         .parent()
@@ -93,13 +97,104 @@ pub fn is_valid_entry_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".."
 }
 
+/// Why a name cannot become a directory entry. Returned instead of a plain
+/// `false` so the caller can say *what* is wrong: reporting "already taken" for
+/// a name the filesystem simply refuses sends the user hunting for a
+/// non-existent duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameRejection {
+    /// Empty, or nothing but whitespace.
+    Empty,
+    /// Holds a character the filesystem cannot store — see
+    /// [`FORBIDDEN_NAME_CHARS`] and the control characters.
+    ForbiddenChar,
+    /// `.` or `..`, which already denote the folder and its parent.
+    DotEntry,
+    /// A name Windows keeps for a device, with or without an extension
+    /// (`NUL`, `COM1`, `LPT1.txt`, …). Windows-only.
+    ReservedDevice,
+    /// Windows silently drops a trailing space or dot, so the entry would not
+    /// carry the name that was typed. Windows-only.
+    TrailingDotOrSpace,
+}
+
+/// Characters no entry name may contain on the running platform, as a
+/// display-ready list. Every OS rejects its own separators; Windows adds the
+/// set reserved by the Win32 naming rules.
+///
+/// Single source of truth: [`check_file_name`] tests against these very
+/// characters, and the interface quotes the same string back to the user.
+#[cfg(windows)]
+pub const FORBIDDEN_NAME_CHARS: &str = "\\ / : * ? \" < > |";
+#[cfg(not(windows))]
+pub const FORBIDDEN_NAME_CHARS: &str = "/";
+
+/// The characters above, in matchable form. `\` stays rejected everywhere for
+/// the reason given on [`rename_in_place`]: a name is never a path.
+const FORBIDDEN_CHARS: &[char] = if cfg!(windows) {
+    &['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+} else {
+    &['/', '\\']
+};
+
+/// Names Windows resolves to a device rather than a file, whatever the folder.
+/// Creating one fails, or worse, writes to the device.
+#[cfg(windows)]
+const RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validates a name destined for the **filesystem**, with the running
+/// platform's rules.
+///
+/// Deliberately stricter than [`is_valid_entry_name`], which stays the rule for
+/// names that never reach the disk (favourite and container labels): a bookmark
+/// may legitimately be called "Draft?" while a file may not.
+pub fn check_file_name(name: &str) -> std::result::Result<(), NameRejection> {
+    if name.is_empty() {
+        return Err(NameRejection::Empty);
+    }
+    if name == "." || name == ".." {
+        return Err(NameRejection::DotEntry);
+    }
+    // Control characters are unusable on every filesystem and invisible in the
+    // field, so they are reported with the other forbidden characters.
+    if name.contains(FORBIDDEN_CHARS) || name.contains(|c: char| (c as u32) < 0x20) {
+        return Err(NameRejection::ForbiddenChar);
+    }
+    #[cfg(windows)]
+    {
+        if name.ends_with(' ') || name.ends_with('.') {
+            return Err(NameRejection::TrailingDotOrSpace);
+        }
+        // The device is matched on the stem: "NUL.txt" is the NUL device too.
+        let stem = name.split('.').next().unwrap_or(name);
+        if RESERVED_DEVICE_NAMES
+            .iter()
+            .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        {
+            return Err(NameRejection::ReservedDevice);
+        }
+    }
+    Ok(())
+}
+
+/// [`check_file_name`] reduced to a yes/no, for the call sites that only gate
+/// an operation and have no message to build.
+pub fn is_valid_file_name(name: &str) -> bool {
+    check_file_name(name).is_ok()
+}
+
 /// Creates an entry (a folder if `is_dir`, otherwise an empty file) named `name`
-/// in `parent`. Rejects an invalid name ([`is_valid_entry_name`]) and a target
+/// in `parent`. Rejects an invalid name ([`check_file_name`]) and a target
 /// that **already exists** (never overwrites). Returns the created path.
 pub fn create_entry(parent: &Path, name: &str, is_dir: bool) -> Result<PathBuf> {
     let name = name.trim();
-    if !is_valid_entry_name(name) {
-        return Err(Error::Workspace(format!("invalid name: {name:?}")));
+    if let Err(reason) = check_file_name(name) {
+        return Err(Error::Workspace(format!(
+            "invalid name: {name:?} ({reason:?})"
+        )));
     }
     let target = parent.join(name);
     // `exists()` ignores broken symlinks. `symlink_metadata`, by contrast,
@@ -1204,6 +1299,81 @@ mod tests {
         assert!(create_entry(&dir, "..", true).is_err());
         assert!(create_entry(&dir, "   ", false).is_err()); // empty after trim
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_name_the_filesystem_refuses_is_told_apart_from_a_name_already_taken() {
+        // The distinction this function exists for: these are rejected on their
+        // spelling alone, with no folder to compare against, so reporting them
+        // as a duplicate would point at an entry that does not exist.
+        assert_eq!(check_file_name(""), Err(NameRejection::Empty));
+        assert_eq!(check_file_name("."), Err(NameRejection::DotEntry));
+        assert_eq!(check_file_name(".."), Err(NameRejection::DotEntry));
+        // Both separators everywhere: a name is never a path, see
+        // `rename_in_place`.
+        assert_eq!(check_file_name("a/b"), Err(NameRejection::ForbiddenChar));
+        assert_eq!(check_file_name("a\\b"), Err(NameRejection::ForbiddenChar));
+        // Invisible in the field, unusable on disk.
+        assert_eq!(check_file_name("a\tb"), Err(NameRejection::ForbiddenChar));
+
+        // Ordinary names stay accepted, including the ones whose punctuation
+        // only looks suspicious.
+        for ok in [
+            "notes.txt",
+            "Rapport 2026",
+            ".clang-format",
+            "a-b_c(1)[2]{3}",
+            "été & co",
+            "archive.tar.gz",
+        ] {
+            assert_eq!(check_file_name(ok), Ok(()), "{ok} should be accepted");
+        }
+
+        // Every character the interface lists must actually be refused: the
+        // message and the rule are held to the same source of truth.
+        for c in FORBIDDEN_NAME_CHARS.chars().filter(|c| !c.is_whitespace()) {
+            assert_eq!(
+                check_file_name(&format!("a{c}b")),
+                Err(NameRejection::ForbiddenChar),
+                "{c} is advertised as forbidden but was accepted"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_only_naming_rules_are_enforced() {
+        // Win32 reserves these whatever the folder, extension included.
+        assert_eq!(check_file_name("NUL"), Err(NameRejection::ReservedDevice));
+        assert_eq!(
+            check_file_name("com1.txt"),
+            Err(NameRejection::ReservedDevice)
+        );
+        // Windows drops these silently, so the entry would not carry the name
+        // that was typed.
+        assert_eq!(
+            check_file_name("report."),
+            Err(NameRejection::TrailingDotOrSpace)
+        );
+        assert_eq!(
+            check_file_name("report "),
+            Err(NameRejection::TrailingDotOrSpace)
+        );
+        // Reserved as a whole name only — a longer name merely starting with
+        // one is a perfectly ordinary file.
+        assert_eq!(check_file_name("NULL.txt"), Ok(()));
+        assert_eq!(check_file_name("console.log"), Ok(()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_only_rules_do_not_leak_onto_unix() {
+        // These are valid names on a Unix filesystem and must stay creatable.
+        for ok in [
+            "NUL", "com1.txt", "report.", "report ", "a:b", "what?", "a*",
+        ] {
+            assert_eq!(check_file_name(ok), Ok(()), "{ok} should be accepted");
+        }
     }
 
     #[test]

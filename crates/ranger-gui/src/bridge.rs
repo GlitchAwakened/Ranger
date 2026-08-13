@@ -3901,6 +3901,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             w.set_rename_current_is_dir(row.is_dir);
             w.set_rename_conflict(false); // current name == itself → no conflict
             w.set_rename_replace_available(false);
+            w.set_rename_name_error(SharedString::new());
             w.set_rename_new_name(row.name);
             w.set_rename_popup_open(true);
         });
@@ -3919,6 +3920,17 @@ pub fn install(window: &MainWindow, state: AppState) {
                 .unwrap_or(RenameNameStatus::Invalid);
             w.set_rename_conflict(status != RenameNameStatus::Valid);
             w.set_rename_replace_available(status == RenameNameStatus::ReplaceableFile);
+            // Says WHICH problem blocks the rename: a name the filesystem
+            // refuses is not a name somebody else already holds.
+            let lang = st.snapshot_config().language;
+            let availability = match status {
+                RenameNameStatus::Valid => EntryNameAvailability::Available,
+                RenameNameStatus::Invalid => EntryNameAvailability::Invalid,
+                RenameNameStatus::Conflict | RenameNameStatus::ReplaceableFile => {
+                    EntryNameAvailability::ExistingNonDirectory
+                }
+            };
+            w.set_rename_name_error(name_error_text(lang, name.as_ref(), availability).into());
         });
     }
     // "Type-ahead" filter of the active view — SHARED with the
@@ -4301,27 +4313,18 @@ pub fn install(window: &MainWindow, state: AppState) {
             if kind != 0 && kind != 1 {
                 w.set_create_name_valid(true);
                 w.set_create_conflict(false);
+                // Clears whatever the folder/file mode had reported: these
+                // modes judge the name by their own rules, further down.
+                w.set_create_name_error(SharedString::new());
                 return;
             }
             let cur = st.current_path();
-            match entry_name_availability_now(&st, &cur, name.trim()) {
-                EntryNameAvailability::Available => {
-                    w.set_create_name_valid(true);
-                    w.set_create_conflict(false);
-                }
-                EntryNameAvailability::Invalid => {
-                    w.set_create_name_valid(false);
-                    w.set_create_conflict(false);
-                }
-                // A reserved name is syntactically fine but already spoken for,
-                // so it reads as a conflict just like an existing entry.
-                EntryNameAvailability::ExistingNonDirectory
-                | EntryNameAvailability::ExistingDirectory
-                | EntryNameAvailability::Reserved => {
-                    w.set_create_name_valid(true);
-                    w.set_create_conflict(true);
-                }
-            }
+            let trimmed = name.trim();
+            // A reserved name is syntactically fine but already spoken for, so
+            // it reads as a conflict just like an existing entry.
+            let availability = entry_name_availability_now(&st, &cur, trimmed);
+            let lang = st.snapshot_config().language;
+            push_create_name_status(&w, lang, trimmed, availability);
         });
     }
     // Creation of a new folder / file / shortcut (empty-area popup) in
@@ -4346,11 +4349,10 @@ pub fn install(window: &MainWindow, state: AppState) {
                 } else {
                     // Final safeguard against an external navigation/change between the
                     // keystroke and the click. A creation never offers to replace.
-                    if entry_name_availability_now(&st, &cur, &name)
-                        != EntryNameAvailability::Available
-                    {
-                        w.set_create_name_valid(ops::is_valid_entry_name(&name));
-                        w.set_create_conflict(ops::is_valid_entry_name(&name));
+                    let availability = entry_name_availability_now(&st, &cur, &name);
+                    if availability != EntryNameAvailability::Available {
+                        let lang = st.snapshot_config().language;
+                        push_create_name_status(&w, lang, &name, availability);
                         return false;
                     }
                     match ops::create_entry(&cur, &name, kind == 0) {
@@ -4363,14 +4365,10 @@ pub fn install(window: &MainWindow, state: AppState) {
                             // An entry may have appeared after the guard check. The popup
                             // stays open and then reflects the newly
                             // observed conflict; `create_entry` guarantees it is left intact.
-                            if matches!(
-                                entry_name_availability_now(&st, &cur, &name),
-                                EntryNameAvailability::ExistingNonDirectory
-                                    | EntryNameAvailability::ExistingDirectory
-                                    | EntryNameAvailability::Reserved
-                            ) {
-                                w.set_create_name_valid(true);
-                                w.set_create_conflict(true);
+                            let late = entry_name_availability_now(&st, &cur, &name);
+                            if late != EntryNameAvailability::Available {
+                                let lang = st.snapshot_config().language;
+                                push_create_name_status(&w, lang, &name, late);
                             }
                             None
                         }
@@ -9121,14 +9119,66 @@ fn with_reservation(on_disk: EntryNameAvailability, reserved: bool) -> EntryName
 }
 
 fn entry_name_availability(parent: &Path, name: &str) -> EntryNameAvailability {
-    if !ops::is_valid_entry_name(name) {
+    if ops::check_file_name(name).is_err() {
         return EntryNameAvailability::Invalid;
     }
     match std::fs::symlink_metadata(parent.join(name)) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => EntryNameAvailability::Available,
+        // A name the OS refuses outright never reached the disk, so there is no
+        // entry occupying it: reporting a conflict would send the user looking
+        // for a duplicate that does not exist. `check_file_name` catches these
+        // beforehand; this keeps the verdict honest for whatever it cannot know
+        // in advance, such as a name a specific filesystem rejects on its own.
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidFilename => {
+            EntryNameAvailability::Invalid
+        }
         Err(_) => EntryNameAvailability::ExistingNonDirectory,
         Ok(meta) if meta.is_dir() => EntryNameAvailability::ExistingDirectory,
         Ok(_) => EntryNameAvailability::ExistingNonDirectory,
+    }
+}
+
+/// Publishes a verdict on the typed name to the Create popup: what the confirm
+/// button may do, and what the user is told. Single point of truth for the
+/// three places that judge the name — the live check on each keystroke and the
+/// two safeguards on confirmation, which must not word the same verdict
+/// differently.
+fn push_create_name_status(
+    window: &MainWindow,
+    lang: Lang,
+    name: &str,
+    availability: EntryNameAvailability,
+) {
+    window.set_create_name_valid(availability != EntryNameAvailability::Invalid);
+    window.set_create_conflict(matches!(
+        availability,
+        EntryNameAvailability::ExistingNonDirectory
+            | EntryNameAvailability::ExistingDirectory
+            | EntryNameAvailability::Reserved
+    ));
+    window.set_create_name_error(name_error_text(lang, name, availability).into());
+}
+
+/// Translated explanation of why a name cannot be used, or `""` when it can.
+/// The interface shows this verbatim, so the reason reaches the user instead of
+/// the catch-all "already taken".
+fn name_error_text(lang: Lang, name: &str, availability: EntryNameAvailability) -> String {
+    match availability {
+        EntryNameAvailability::Available => String::new(),
+        EntryNameAvailability::ExistingNonDirectory
+        | EntryNameAvailability::ExistingDirectory
+        | EntryNameAvailability::Reserved => i18n::tr(lang, "paste_conflict_taken"),
+        EntryNameAvailability::Invalid => match ops::check_file_name(name) {
+            // A field the user has not filled in yet: the disabled button says
+            // enough, an error message would only scold them for typing nothing.
+            Ok(()) | Err(ops::NameRejection::Empty) => String::new(),
+            Err(ops::NameRejection::DotEntry) => i18n::tr(lang, "name_error_dot_entry"),
+            Err(ops::NameRejection::ReservedDevice) => i18n::tr(lang, "name_error_reserved"),
+            Err(ops::NameRejection::TrailingDotOrSpace) => i18n::tr(lang, "name_error_trailing"),
+            Err(ops::NameRejection::ForbiddenChar) => {
+                i18n::tr(lang, "name_error_chars").replace("{chars}", ops::FORBIDDEN_NAME_CHARS)
+            }
+        },
     }
 }
 
@@ -12507,6 +12557,35 @@ fn self_icon(path: &Path, ext: &str, big: bool) -> Image {
     cached_path_icon(path, big).unwrap_or_else(|| ext_app_icon(ext, big))
 }
 
+#[cfg(not(windows))]
+thread_local! {
+    /// Resolved launcher icons, by `.desktop` path. Finding one walks the icon
+    /// theme and decoding it parses an image; a folder of launchers would pay
+    /// both on every re-listing — a sort or a filter — without this.
+    static DESKTOP_ICON_CACHE: RefCell<HashMap<String, Option<Image>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Icon of a `.desktop` launcher, or `None` when it declares none or names one
+/// the theme does not provide.
+///
+/// The file is handed to the renderer by PATH rather than decoded here: it
+/// reads SVG as well as bitmaps, and launcher icons are very often vector —
+/// decoding to fixed-size pixels would throw that away. Not split by size for
+/// the same reason: one file serves every row height.
+#[cfg(not(windows))]
+fn cached_desktop_icon(path: &Path) -> Option<Image> {
+    let key = path.display().to_string();
+    if let Some(cached) = DESKTOP_ICON_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let image = openwith::desktop_icon_path(path)
+        .and_then(|icon| Image::load_from_path(&icon).ok())
+        .filter(|image| image.size().width > 0);
+    DESKTOP_ICON_CACHE.with(|c| c.borrow_mut().insert(key, image.clone()));
+    image
+}
+
 thread_local! {
     /// Cache of `.lnk` shortcut targets by PATH → `(target_is_folder,
     /// target_extension)`, or `None` if unresolved. Avoids a COM call + a `stat`
@@ -12608,6 +12687,15 @@ fn row_app_icon(
 ) -> (Image, bool) {
     if is_dir {
         return (Image::default(), false);
+    }
+    // A launcher shows the application it starts, like everywhere else on the
+    // desktop — a row of identical generic icons says nothing about which game
+    // or program each entry actually is.
+    #[cfg(not(windows))]
+    if ext == "desktop"
+        && let Some(icon) = cached_desktop_icon(&Path::new(parent_display).join(name))
+    {
+        return (icon, false);
     }
     if ext == "lnk" {
         return resolve_lnk_icon(parent_display, name, big)
