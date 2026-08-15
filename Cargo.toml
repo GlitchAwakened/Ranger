@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/ranger-core", "crates/ranger-gui"]
 
 [workspace.package]
-version      = "0.2.9"
+version      = "0.3.0"
 edition      = "2024"
 rust-version = "1.88"
 license      = "GPL-3.0-or-later"

@@ -45,6 +45,20 @@ pub struct Place {
     /// Eject/disconnect target: `/dev/sdX1` (Linux), drive letter `X:`
     /// (local or mapped-network Windows drive), otherwise empty (WSL, GVFS…).
     pub device: String,
+    /// Capacity of the volume in bytes, `0` when it could not be read.
+    ///
+    /// Zero is the "unknown" marker rather than an `Option`: an empty card
+    /// reader, an optical drive with no disc and a share that never answered
+    /// all mean the same thing to the interface — show no capacity — and a
+    /// volume of genuinely zero bytes does not exist.
+    pub total_bytes: u64,
+    /// Bytes still writable **by this user**, `0` when unknown.
+    ///
+    /// Deliberately the user-facing figure, not the raw free count: a
+    /// filesystem keeps a reserve (ext4 holds back 5% for root) and a share may
+    /// impose a quota. The badge answers "can I still write here", so it must
+    /// report what the caller could actually use.
+    pub free_bytes: u64,
 }
 
 impl Place {
@@ -57,6 +71,12 @@ impl Place {
             name,
             removable: false,
             device: String::new(),
+            // A shortcut and the trash sit on a volume that is listed on its
+            // own line: repeating its capacity here would state the same fact
+            // twice under two names, which reads as a contradiction rather
+            // than as agreement.
+            total_bytes: 0,
+            free_bytes: 0,
         }
     }
 }
@@ -169,6 +189,13 @@ pub fn drives() -> Vec<Place> {
                 } else {
                     d.name().to_string_lossy().to_string()
                 },
+                // Free of charge: the listing above already refreshed these,
+                // so the `statvfs` behind them is a cost this scan pays
+                // whether or not anything reads the result. Shares are left
+                // unmeasured all the same — the figure would describe the
+                // server, not what this user may write.
+                total_bytes: if is_net { 0 } else { d.total_space() },
+                free_bytes: if is_net { 0 } else { d.available_space() },
             });
         }
     }
@@ -194,6 +221,13 @@ pub fn drives() -> Vec<Place> {
     // Guarantees the root "/" comes first: some systems (atomic / overlay /
     // composefs) don't report it via `sysinfo` → without this the Drives
     // section could be empty. (Windows always lists its letters.)
+    //
+    // It carries NO capacity, deliberately. On such a system the root is a
+    // small read-only overlay — measured at 45 MB, entirely full — so a gauge
+    // there would report the size of the overlay rather than of any storage
+    // the user can write to. A figure that is technically exact and
+    // practically meaningless is worse than none: the volumes that do hold the
+    // user's data are listed on their own lines, with their own gauges.
     #[cfg(not(windows))]
     if !out.iter().any(|p| p.path == Path::new("/")) {
         out.insert(
@@ -329,6 +363,19 @@ mod windrives {
     unsafe extern "system" {
         fn GetLogicalDrives() -> u32;
         fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+        /// Capacity of a volume. The FIRST output is what the *caller* may
+        /// still write, which a quota can make smaller than the volume's own
+        /// free count — that is the figure a user cares about.
+        fn GetDiskFreeSpaceExW(
+            lp_directory_name: *const u16,
+            lp_free_bytes_available_to_caller: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+        /// Suppresses the modal the system would otherwise raise on a drive
+        /// with no media — the "There is no disk in the drive" box, which a
+        /// background probe must never be able to trigger.
+        fn SetThreadErrorMode(new_mode: u32, old_mode: *mut u32) -> i32;
         fn GetVolumeInformationW(
             lp_root_path_name: *const u16,
             lp_volume_name_buffer: *mut u16,
@@ -592,6 +639,36 @@ mod windrives {
         unsafe { GetLogicalDrives() }
     }
 
+    /// Capacity of a volume as `(total, free_for_this_user)`, `(0, 0)` when it
+    /// cannot be read.
+    ///
+    /// A drive with no media — an empty card reader slot, an optical drive
+    /// standing open — is the hazard here: left to itself the call raises a
+    /// modal asking for a disc, and it can stall while the hardware is polled.
+    /// `SEM_FAILCRITICALERRORS` turns that into a plain failure, and the mode
+    /// is restored right after so nothing else inherits it.
+    fn volume_capacity(root_w: &[u16]) -> (u64, u64) {
+        const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+        let mut previous_mode: u32 = 0;
+        let changed =
+            unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mut previous_mode) } != 0;
+
+        let (mut free_for_caller, mut total) = (0u64, 0u64);
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                root_w.as_ptr(),
+                &mut free_for_caller,
+                &mut total,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+
+        if changed {
+            unsafe { SetThreadErrorMode(previous_mode, std::ptr::null_mut()) };
+        }
+        if ok { (total, free_for_caller) } else { (0, 0) }
+    }
+
     /// Is the letter a mapped NETWORK drive? `GetDriveTypeW` reads the local
     /// mount table (no network access, instantaneous).
     pub fn drive_is_remote(letter: char) -> bool {
@@ -631,6 +708,14 @@ mod windrives {
                     _ => letter_str.clone(),
                 }
             };
+            // Local volumes only. A mapped network letter is skipped for the
+            // same reason a share is on the other platform: the call leaves the
+            // machine and can stall, and the answer describes the server.
+            let (total_bytes, free_bytes) = if is_net {
+                (0, 0)
+            } else {
+                volume_capacity(&root_w)
+            };
             out.push(Place {
                 kind: if is_net {
                     PlaceKind::Network
@@ -639,6 +724,8 @@ mod windrives {
                 },
                 path: PathBuf::from(&root),
                 name,
+                total_bytes,
+                free_bytes,
                 // Ejectable if removable/CD, OR if it's a "fixed" disk but on
                 // an external bus (USB/1394/SD/MMC): Windows classifies many
                 // USB flash drives/SSDs as DRIVE_FIXED, hence the bus check.
@@ -763,6 +850,9 @@ mod windrives {
                     name: distro,
                     removable: false,
                     device: String::new(),
+                    // Reached through a network path: same reasoning as a share.
+                    total_bytes: 0,
+                    free_bytes: 0,
                 });
             }
             unsafe { RegCloseKey(hsub) };
@@ -963,6 +1053,11 @@ fn gvfs_mounts() -> Vec<Place> {
                 name: gvfs_pretty_name(&raw),
                 removable: false,
                 device: String::new(),
+                // Never measured: asking a share for its size is a round trip
+                // that can stall for seconds, and the answer would be the
+                // server's free space, not the user's quota on it.
+                total_bytes: 0,
+                free_bytes: 0,
             });
         }
     }

@@ -5,7 +5,7 @@
 //!     `open_parent` also reveals the item (`explorer /select,` on Windows).
 //!   - `open_terminal`: launches a terminal with the desired `cwd` (known list
 //!     on Linux; Windows Terminal then `cmd` on Windows).
-//!   - `copy_to_clipboard` / `read_clipboard`: `arboard` crate (Win / X11 /
+//!   - `copy_to_clipboard`: `arboard` crate (Win / X11 /
 //!     Wayland), via a persistent instance (see note below).
 //!
 //! All actions are **fire-and-forget**: we log the error if one
@@ -58,23 +58,10 @@ fn with_clipboard<R>(
     })
 }
 
-/// Reads the clipboard (text). Returns `None` if empty or unavailable.
-pub fn read_clipboard() -> Option<String> {
-    match with_clipboard(|c| c.get_text()) {
-        Ok(text) => {
-            let trimmed = text.trim().to_string();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        }
-        Err(err) => {
-            debug!(error = %err, "read_clipboard");
-            None
-        }
-    }
-}
+// Reading the clipboard used to live here, for the URL bar's "Paste". That
+// menu now goes through the field's own paste, which drops the text at the
+// caret instead of replacing the whole line — so nothing reads the clipboard
+// from this side any more. Writing it still does, just below.
 
 /// Pushes `text` into the clipboard.
 pub fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -337,17 +324,23 @@ fn has_exec_bit(path: &Path) -> bool {
     }
 }
 
-/// Is `path` a desktop launcher its owner has approved?
+/// Is `path` a desktop launcher?
 ///
-/// The executable bit is the same trust mark as for a native program, and the
-/// rule the KDE file manager applies: an entry can name any command behind any
-/// display name and icon, so one that has never been marked stays a text file.
+/// The executable bit is deliberately NOT required here, unlike for a native
+/// program. It was at first, by analogy, and that was wrong: the desktop's own
+/// rule for a launcher never looks at it — it reads the entry and starts what
+/// it names. Requiring it made every launcher that did not happen to carry the
+/// bit fall through to the generic opener, which hands a launcher back as the
+/// text file it is made of, in an editor.
+///
+/// Whether the entry is actually usable is left to the launch itself: an
+/// unreadable or `Exec`-less file fails there, and the caller then opens it
+/// like any other document.
 #[cfg(not(windows))]
 fn is_desktop_launcher(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("desktop"))
-        && has_exec_bit(path)
 }
 
 #[cfg(not(windows))]
@@ -358,8 +351,19 @@ pub fn open_path(path: &Path) -> Result<()> {
     // has to be skipped. Ranger reads the entry itself and starts what it
     // names.
     if is_desktop_launcher(path) {
-        info!(path = %path.display(), "launch desktop entry");
-        return crate::openwith::launch_desktop_file(path);
+        match crate::openwith::launch_desktop_file(path) {
+            Ok(()) => {
+                info!(path = %path.display(), "launch desktop entry");
+                return Ok(());
+            }
+            // Carries the `.desktop` name but nothing to start: no `Exec`, no
+            // `URL`, or unreadable. It is then just a file, and opening it the
+            // ordinary way is more useful than reporting a failure.
+            Err(err) => {
+                debug!(error = %err, path = %path.display(),
+                    "not a usable desktop entry, opening it as a document");
+            }
+        }
     }
     // A program is started directly instead of being handed to the desktop.
     //
@@ -1414,7 +1418,7 @@ mod terminal_tests {
 
 #[cfg(all(test, unix))]
 mod program_tests {
-    use super::is_launchable_program;
+    use super::{is_desktop_launcher, is_launchable_program};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -1468,6 +1472,34 @@ mod program_tests {
         let folder = dir.join("tools.sh");
         std::fs::create_dir(&folder).unwrap();
         assert!(!is_launchable_program(&folder));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_launcher_is_recognised_whether_or_not_it_carries_the_executable_bit() {
+        let dir = scratch();
+
+        // The regression this guards. Requiring the bit sent a launcher that
+        // did not carry it to the generic opener, which showed the entry's
+        // source text in an editor instead of starting the application. The
+        // desktop's own rule never consults the bit for a launcher.
+        assert!(is_desktop_launcher(&write(
+            &dir,
+            "Blender 5.desktop",
+            0o644
+        )));
+        assert!(is_desktop_launcher(&write(&dir, "game.desktop", 0o755)));
+        // Matched on the extension alone, whatever its case.
+        assert!(is_desktop_launcher(&write(&dir, "App.DESKTOP", 0o644)));
+
+        // Anything else is not a launcher, bit or no bit.
+        assert!(!is_desktop_launcher(&write(&dir, "notes.txt", 0o644)));
+        assert!(!is_desktop_launcher(&write(&dir, "runner", 0o755)));
+
+        // And a launcher is never mistaken for a native program: running the
+        // entry as a script would do the wrong thing, whoever calls.
+        assert!(!is_launchable_program(&write(&dir, "run.desktop", 0o755)));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -243,12 +243,14 @@ struct Tab {
     /// Selection anchor for Shift+click. `-1` if none.
     selection_anchor: i32,
     /// Display mode: `false` = list (icons), `true` = previews
-    /// (thumbnails). DERIVED from `zoom` (`preview = zoom >= THUMB_ZOOM`) and kept
-    /// because it's the one persisted per tab in the workspace TOML.
+    /// (thumbnails). DERIVED from `zoom` (`preview = zoom >= THUMB_ZOOM`) and
+    /// persisted per tab in the workspace TOML alongside it — a workspace
+    /// written before the level existed carries only this flag.
     preview: bool,
-    /// Zoom level of entries (Ctrl+wheel). Mapped to a row
-    /// height by `zoom_to_height`. Not persisted as-is: rebuilt from
-    /// `preview` on restore (list vs thumbnails).
+    /// Zoom level of entries (Ctrl+wheel). Mapped to a row height by
+    /// `zoom_to_height`, and persisted per tab in the workspace TOML: a view
+    /// left at a chosen thumbnail size reopens at that size, not at the
+    /// default for its mode.
     zoom: i32,
     /// Whether hidden files are shown (dotfiles + Windows HIDDEN attribute).
     /// `false` by default. Persisted per tab in the workspace TOML.
@@ -296,22 +298,30 @@ impl Tab {
         path: PathBuf,
         sort: SortState,
         preview: bool,
+        zoom: Option<i32>,
         show_hidden: bool,
         group_mode: GroupMode,
     ) -> Self {
         let mut h = NavHistory::default();
         h.push(path.clone());
+        // A workspace saved before the level was persisted carries none: the
+        // tab reopens at the default for the mode it was in, exactly as it
+        // used to. A hand-edited file is clamped rather than trusted.
+        let zoom = match zoom {
+            Some(z) => z.clamp(MIN_ZOOM, MAX_ZOOM),
+            None if preview => THUMB_DEFAULT_ZOOM,
+            None => LIST_DEFAULT_ZOOM,
+        };
         Self {
             current_path: path,
             history: h,
             sort,
             selection_anchor: -1,
-            preview,
-            zoom: if preview {
-                THUMB_DEFAULT_ZOOM
-            } else {
-                LIST_DEFAULT_ZOOM
-            },
+            // Derived from the level, never read back from the file: the two
+            // are stored side by side and an edited workspace could hold
+            // `preview = true` with a list-mode zoom. The finer value wins.
+            preview: zoom >= THUMB_ZOOM,
+            zoom,
             show_hidden,
             group_mode,
             cursor: -1,
@@ -330,6 +340,7 @@ fn tab_to_state(tab: &Tab) -> TabState {
         preview: tab.preview,
         show_hidden: tab.show_hidden,
         group_mode: tab.group_mode,
+        zoom: Some(tab.zoom),
     }
 }
 
@@ -341,6 +352,7 @@ fn tab_from_state(tab: TabState) -> Tab {
             order: tab.sort_order,
         },
         tab.preview,
+        tab.zoom,
         tab.show_hidden,
         tab.group_mode,
     )
@@ -398,6 +410,7 @@ impl TabBook {
             src.current_path.clone(),
             src.sort,
             src.preview,
+            Some(src.zoom),
             src.show_hidden,
             src.group_mode,
         );
@@ -787,20 +800,29 @@ fn push_settings_columns(window: &MainWindow, lang: Lang, cols: &[ColumnSpec]) {
     let strings = i18n::strings_for(lang);
     let infos: Vec<ColumnInfo> = columns::sanitize(cols.to_vec())
         .iter()
-        .map(|c| {
-            let mut info = column_info(&strings, c, 0.0);
-            // Settings checkbox: MORE explicit label for the columns
-            // reserved for images (the column header in the view stays short,
-            // via `column_info`).
-            match c.id.as_str() {
-                "resolution" => info.label = strings.settings_col_resolution.clone(),
-                "depth" => info.label = strings.settings_col_depth.clone(),
-                _ => {}
-            }
-            info
-        })
+        .map(|c| column_info_explicit(&strings, c, 0.0))
         .collect();
     window.set_settings_columns(ModelRc::new(VecModel::from(infos)));
+}
+
+/// [`column_info`] with the wording used wherever a column is CHOSEN from a
+/// list — the Settings checkboxes and the header's context menu. Both name the
+/// columns reserved for images outright ("Resolution (image)"), because a list
+/// of column names read out of context gives no clue what "Depth" measures.
+///
+/// The header itself keeps the short form from [`column_info`]: it sits in a
+/// resizable width the user may have narrowed, and there the surrounding
+/// values say what the column holds.
+fn column_info_explicit(strings: &crate::Strings, c: &ColumnSpec, offset: f32) -> ColumnInfo {
+    let mut info = column_info(strings, c, offset);
+    // The i18n keys keep their `settings_` prefix: the wording is the same in
+    // both lists, and renaming them across five catalogues would buy nothing.
+    match c.id.as_str() {
+        "resolution" => info.label = strings.settings_col_resolution.clone(),
+        "depth" => info.label = strings.settings_col_depth.clone(),
+        _ => {}
+    }
+    info
 }
 
 /// Builds a `ColumnInfo` (id + i18n label + visible + offset) for the GUI.
@@ -1415,7 +1437,7 @@ pub fn install(window: &MainWindow, state: AppState) {
     window.set_left_panel(if cfg.left_panel >= 1 { 1 } else { 0 });
     window.set_sidebar_width(cfg.sidebar_width.max(140) as f32);
     push_sidebar_sections_ui(window, &state);
-    refresh_sidebar(window);
+    refresh_sidebar(window, cfg.language);
     // The Slint chevrons immediately update the live workspace state.
     // The title then re-reads the single dirty source; the Workspaces panel
     // already resynchronizes each time it opens via `ws-refresh`.
@@ -1551,11 +1573,12 @@ pub fn install(window: &MainWindow, state: AppState) {
     // Re-scan of places (mounted/unmounted volumes) when the sidebar opens.
     {
         let weak = window.as_weak();
+        let st = state.clone();
         window.on_sidebar_refresh(move || {
             if let Some(w) = weak.upgrade() {
                 #[cfg(windows)]
                 crate::winportable::request_refresh();
-                refresh_sidebar(&w);
+                refresh_sidebar(&w, st.snapshot_config().language);
             }
         });
     }
@@ -1703,16 +1726,39 @@ pub fn install(window: &MainWindow, state: AppState) {
     {
         let weak = window.as_weak();
         let sig = state.last_drives_sig.clone();
+        let st = state.clone();
+        // Free space moves without any mount changing, so the mount signature
+        // alone would leave every capacity gauge frozen until the next plug or
+        // unplug. It gets its own check, on a slower beat: a capacity is worth
+        // re-reading every few seconds, not every one and a half, and the
+        // reading costs a `statvfs` per volume.
+        let space_beat = Cell::new(0u32);
+        let space_sig = Cell::new(drives_space_signature(state.snapshot_config().language));
         window.on_poll_drives(move || {
             let Some(w) = weak.upgrade() else { return };
             // Triggers the next scan without waiting for its result; `cur` only
             // reads the atomic cache from the previous scan.
             #[cfg(windows)]
             crate::winportable::request_refresh();
+            let lang = st.snapshot_config().language;
+            let mut stale = false;
             let cur = sidebar_drives_signature();
             if cur != sig.get() {
                 sig.set(cur);
-                refresh_sidebar(&w);
+                stale = true;
+            }
+            // One beat in eight of the 1.5 s poll, so roughly every 12 s.
+            let beat = space_beat.get().wrapping_add(1);
+            space_beat.set(beat);
+            if beat.is_multiple_of(8) {
+                let cur_space = drives_space_signature(lang);
+                if cur_space != space_sig.get() {
+                    space_sig.set(cur_space);
+                    stale = true;
+                }
+            }
+            if stale {
+                refresh_sidebar(&w, lang);
             }
         });
     }
@@ -2544,28 +2590,11 @@ pub fn install(window: &MainWindow, state: AppState) {
             }
         });
     }
-    // URL bar right-click menu: paste a path / copy.
-    {
-        let weak = window.as_weak();
-        window.on_url_paste(move || {
-            let Some(w) = weak.upgrade() else { return };
-            // Paste the clipboard INTO the URL field (without submitting): the
-            // panel is already in edit mode (the right-click put it there), and
-            // the user submits themselves with Enter.
-            if let Some(text) = actions::read_clipboard() {
-                w.set_url_edit_text(text.trim().to_string().into());
-            }
-        });
-    }
-    {
-        let st = state.clone();
-        window.on_url_copy(move || {
-            let cur = st.current_path();
-            if let Err(err) = actions::copy_to_clipboard(&cur.display().to_string()) {
-                error!(error = %err, "url copy path failed");
-            }
-        });
-    }
+    // The URL menu's "Copy" and "Paste" are handled entirely in the interface,
+    // by the field itself. Driving them from here meant working on the whole
+    // text: copying took the current path whatever was selected, and pasting
+    // replaced the entire line instead of dropping the clipboard at the caret.
+    // Only the field knows its selection and its caret.
 
     // ----- Row activation (double-click) -----
     {
@@ -6163,7 +6192,15 @@ fn reset_into(window: &MainWindow, state: &AppState) {
 /// All the retained fields are captured DIRECTLY from the live state, written
 /// as-is into the TOML, and faithfully reconstructed by `build_panels` → the
 /// comparison is stable in both directions.
-type TabSig = (String, SortColumn, SortOrder, bool, bool, GroupMode);
+type TabSig = (
+    String,
+    SortColumn,
+    SortOrder,
+    bool,
+    bool,
+    GroupMode,
+    Option<i32>,
+);
 type WorkspaceSig = (Vec<(Vec<TabSig>, u8)>, SidebarSectionsState);
 fn workspace_signature(ws: &WorkspaceState) -> WorkspaceSig {
     let panels = ws
@@ -6181,6 +6218,7 @@ fn workspace_signature(ws: &WorkspaceState) -> WorkspaceSig {
                         t.preview,
                         t.show_hidden,
                         t.group_mode,
+                        t.zoom,
                     )
                 })
                 .collect();
@@ -6556,7 +6594,7 @@ fn spawn_eject(window: &MainWindow, state: &AppState, device: String, op: EjectO
                             EjectOp::Disconnect => s.net_disconnected,
                         },
                     );
-                    refresh_sidebar(&w); // the drive is gone
+                    refresh_sidebar(&w, lang); // the drive is gone
                 }
                 Err(err) => {
                     let reason = i18n::eject_error_message(lang, &err);
@@ -6570,7 +6608,84 @@ fn spawn_eject(window: &MainWindow, state: &AppState, device: String, op: EjectO
 
 /// (Re)builds the "Places" sidebar model (drives, shortcuts,
 /// network, trash) from `ranger-core::places` and pushes it to the UI.
-fn refresh_sidebar(window: &MainWindow) {
+/// Fingerprint of what the capacity gauges currently DISPLAY.
+///
+/// Hashes the rendered figures and warning levels, never the raw byte counts:
+/// a volume ticking over by a few kilobytes changes its bytes constantly while
+/// the text stays "38,0/64,0 Go". Comparing what is drawn means the sidebar is
+/// rebuilt only when the user would actually see a difference, which keeps the
+/// existing "rebuild only if changed" contract intact — a rebuild replaces the
+/// row models and would otherwise churn under an idle disk.
+fn drives_space_signature(lang: Lang) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for place in ranger_core::places::drives() {
+        let space = drive_space_ui(&place, lang);
+        place.path.hash(&mut hasher);
+        space.level.hash(&mut hasher);
+        space.text.hash(&mut hasher);
+        space.text_short.hash(&mut hasher);
+        space.hint.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// What the capacity gauge shows for one place. Level `-1` means no gauge.
+///
+/// Only a local volume that answered gets one. A share is never measured (the
+/// call leaves the machine and the answer would describe the server), and
+/// neither is a shortcut or the trash, which live on a volume already listed on
+/// its own line — stating the same capacity twice under two names reads as a
+/// contradiction, not as agreement.
+struct DriveSpaceUi {
+    /// `-1` no gauge · `0` roomy · `1` low · `2` critical.
+    level: i32,
+    /// Share of the volume in use, 0..1 — the bar grows with it.
+    used_ratio: f32,
+    /// "26,0/57,3 Go", and the used figure alone for a narrow panel.
+    text: String,
+    text_short: String,
+    /// One-line breakdown for the hover hint, where there is room to name
+    /// each figure instead of leaving the reader to infer which is which.
+    hint: String,
+}
+
+impl DriveSpaceUi {
+    /// No capacity to show: not a local volume, or one that did not answer.
+    fn none() -> Self {
+        DriveSpaceUi {
+            level: -1,
+            used_ratio: 0.0,
+            text: String::new(),
+            text_short: String::new(),
+            hint: String::new(),
+        }
+    }
+}
+
+fn drive_space_ui(place: &ranger_core::places::Place, lang: Lang) -> DriveSpaceUi {
+    use ranger_core::places::PlaceKind;
+    if place.kind != PlaceKind::Drive || place.total_bytes == 0 {
+        return DriveSpaceUi::none();
+    }
+    let total = place.total_bytes;
+    let free = place.free_bytes.min(total);
+    let used = total - free;
+    DriveSpaceUi {
+        // The warning still comes from what is LEFT: that is the figure that
+        // decides whether the next operation fits, whatever the gauge draws.
+        level: rfs::free_space_level(free, total),
+        used_ratio: used as f32 / total as f32,
+        text: rfs::format_used_total(used, total, lang),
+        text_short: rfs::format_size(used, lang),
+        hint: i18n::tr(lang, "drive_space_hint")
+            .replace("{free}", &rfs::format_size(free, lang))
+            .replace("{used}", &rfs::format_size(used, lang))
+            .replace("{total}", &rfs::format_size(total, lang)),
+    }
+}
+
+fn refresh_sidebar(window: &MainWindow, lang: Lang) {
     use ranger_core::places::{self, PlaceKind};
     // Icon code (see SidebarItem): 0 folder · 1 home · 2 drive · 3
     // trash · 4 network · 5 phone.
@@ -6583,15 +6698,21 @@ fn refresh_sidebar(window: &MainWindow) {
             PlaceKind::Network => 4,
         }
     }
-    fn place_item(p: places::Place) -> SidebarPlace {
+    let place_item = |p: places::Place| -> SidebarPlace {
+        let space = drive_space_ui(&p, lang);
         SidebarPlace {
             label: p.name.into(),
             path: p.path.display().to_string().into(),
             kind: kind_code(p.kind),
             removable: p.removable,
             device: p.device.into(),
+            space_level: space.level,
+            space_used_ratio: space.used_ratio,
+            space_text: space.text.into(),
+            space_text_short: space.text_short.into(),
+            space_hint: space.hint.into(),
         }
-    }
+    };
     let shortcuts = places::user_places()
         .into_iter()
         .map(place_item)
@@ -6615,6 +6736,14 @@ fn refresh_sidebar(window: &MainWindow) {
                 kind: 5,
                 removable: false,
                 device: SharedString::new(),
+                // A phone is addressed through a Shell parsing name, not a
+                // path a filesystem call can measure; asking its capacity
+                // would be a device query on the UI thread.
+                space_level: -1,
+                space_used_ratio: 0.0,
+                space_text: SharedString::new(),
+                space_text_short: SharedString::new(),
+                space_hint: SharedString::new(),
             });
         }
         drives
@@ -8474,7 +8603,11 @@ pub fn suppress_workspace_persist() -> bool {
 /// file name → unambiguous).
 fn serialize_tab(tab: &Tab, drop: (i32, i32)) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        // The zoom is APPENDED, after the drop point, so the two directions
+        // stay compatible between instances of different versions: an older
+        // receiver reads the fields it knows and ignores the extra one, a
+        // newer receiver finds nothing at that index and falls back.
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         tab.current_path.display(),
         tab.sort.column.code(),
         u8::from(matches!(tab.sort.order, SortOrder::Asc)),
@@ -8483,6 +8616,7 @@ fn serialize_tab(tab: &Tab, drop: (i32, i32)) -> String {
         tab.group_mode.code(),
         drop.0,
         drop.1,
+        tab.zoom,
     )
 }
 
@@ -8503,6 +8637,7 @@ fn deserialize_tab(payload: &str) -> Option<(Tab, Option<(i32, i32)>)> {
         PathBuf::from(p[0]),
         SortState { column, order },
         p[3] == "1",
+        p.get(8).and_then(|z| z.parse().ok()),
         p[4] == "1",
         GroupMode::from_code(p[5]).unwrap_or(GroupMode::FoldersFirst),
     );
@@ -10629,10 +10764,14 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
                     }
                     v
                 })),
+                // The check/uncheck menu names the image-only columns in full,
+                // like the Settings list: read as a bare list, "Depth" does not
+                // say what it measures. The visible headers just above keep the
+                // short form.
                 columns_menu: ModelRc::new(VecModel::from(
                     p.columns
                         .iter()
-                        .map(|c| column_info(&strings, c, 0.0))
+                        .map(|c| column_info_explicit(&strings, c, 0.0))
                         .collect::<Vec<_>>(),
                 )),
                 preview_mode: tab.preview,
@@ -13303,6 +13442,7 @@ fn build_panels(ws: WorkspaceState) -> (Vec<Panel>, LayoutNode, usize) {
                 path,
                 sort,
                 ts.preview,
+                ts.zoom,
                 ts.show_hidden,
                 ts.group_mode,
             ));
@@ -15303,6 +15443,7 @@ mod tests {
             preview: false,
             show_hidden: false,
             group_mode: GroupMode::FoldersFirst,
+            zoom: None,
         }
     }
 
@@ -15347,6 +15488,21 @@ mod tests {
         let mut c = ws(vec![panel(vec![tab(r"C:\a")])]);
         c.panels[0].tabs[0].preview = true;
         assert!(workspaces_differ(&a, &c));
+
+        // The thumbnail zoom is saved with the view, so changing it has to
+        // raise the asterisk like any other per-tab setting — the title and
+        // the Update button both read this one comparison.
+        let mut d = ws(vec![panel(vec![tab(r"C:\a")])]);
+        d.panels[0].tabs[0].zoom = Some(4);
+        assert!(workspaces_differ(&a, &d));
+
+        // Two levels that differ are two different states, even inside
+        // preview mode where `preview` alone cannot tell them apart.
+        let mut e = ws(vec![panel(vec![tab(r"C:\a")])]);
+        e.panels[0].tabs[0].zoom = Some(2);
+        let mut f = ws(vec![panel(vec![tab(r"C:\a")])]);
+        f.panels[0].tabs[0].zoom = Some(5);
+        assert!(workspaces_differ(&e, &f));
     }
 
     /// Tab bar position (per-view): counted.

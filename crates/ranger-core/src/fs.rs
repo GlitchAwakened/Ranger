@@ -579,6 +579,71 @@ pub fn format_size(bytes: u64, lang: Lang) -> String {
     format!("{s} {}", units[idx])
 }
 
+/// How comfortable the remaining space on a volume is: `0` roomy, `1` low,
+/// `2` critical. Used to colour the sidebar capacity badge.
+///
+/// A share alone is not enough. "90% used" leaves 400 GB on a 4 TB archive,
+/// which is no problem at all, and 3 GB on a 32 GB stick, which is. So each
+/// level pairs a ratio with an absolute amount, and the ratio is capped by a
+/// ceiling above which no percentage justifies an alarm:
+///
+///   - the absolute floors (4 / 16 GiB) are where a single large operation
+///     stops fitting — 4 GiB is also the largest file FAT32 can hold, and the
+///     order of magnitude of an installer or a disc image;
+///   - the ratios (10% / 20%) are the classic filesystem health marks: ext4
+///     reserves 5% for root, and both ext4 and NTFS lose allocation locality
+///     below a tenth free, as do SSDs their spare area;
+///   - the ceilings (128 / 256 GiB) keep a large archive quiet: 700 GB free is
+///     not a warning, whatever fraction of the disk it represents.
+pub fn free_space_level(free: u64, total: u64) -> i32 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if total == 0 {
+        return 0;
+    }
+    if free < 4 * GIB || (free < total / 10 && free < 128 * GIB) {
+        return 2;
+    }
+    if free < 16 * GIB || (free < total / 5 && free < 256 * GIB) {
+        return 1;
+    }
+    0
+}
+
+/// Formats a used/total pair for the capacity gauge, both figures sharing the
+/// **total's** unit so they can be compared at a glance: `26,0/57,3 Go`.
+///
+/// [`format_size`] cannot do this — called twice it picks each number's own
+/// unit, so a nearly empty disk would read "900 Mo/1,8 To" and force the reader
+/// to convert before judging anything. Same base-1024 convention and same
+/// localized unit names, so the gauge agrees with the size column.
+///
+/// Used rather than free, and it must stay that way: the bar beside these
+/// figures grows as the volume fills, so a figure counting DOWN while the bar
+/// counts up left the reader with two contradictory readings of one fact. The
+/// free space has its own, unambiguous place in the hover hint.
+pub fn format_used_total(used: u64, total: u64, lang: Lang) -> String {
+    let units = size_units(lang);
+    // Unit of the total: the larger of the two, so the pair stays comparable.
+    let mut scale = 1.0_f64;
+    let mut idx = 0usize;
+    while (total as f64) / scale >= 1024.0 && idx + 1 < units.len() {
+        scale *= 1024.0;
+        idx += 1;
+    }
+    let decimals = if idx == 0 { 0 } else { 1 };
+    let used_scaled = used as f64 / scale;
+    let total_scaled = total as f64 / scale;
+    // Spaces around the slash: at this size the two figures ran into the
+    // separator and read as one long number.
+    let text = format!("{used_scaled:.decimals$} / {total_scaled:.decimals$}");
+    let text = if matches!(lang, Lang::Fr) {
+        text.replace('.', ",")
+    } else {
+        text
+    };
+    format!("{text} {}", units[idx])
+}
+
 /// A single bounded walk over `path` computing BOTH its recursive **max mtime**
 /// (the most recent modification date among the folder and its descendants, up
 /// to `mtime_depth` levels) AND its recursive **total size** (sum of descendant
@@ -871,6 +936,71 @@ mod tests {
     fn classify_unknown_extension_is_file() {
         assert_eq!(classify_kind(Some("xyz123"), false), FileKind::File);
         assert_eq!(classify_kind(None, false), FileKind::File);
+    }
+
+    #[test]
+    fn the_capacity_warning_weighs_the_share_against_the_amount() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const TIB: u64 = 1024 * GIB;
+
+        // Roomy.
+        assert_eq!(free_space_level(38 * GIB, 64 * GIB), 0);
+        assert_eq!(free_space_level(180 * GIB, 460 * GIB), 0);
+        // A share alone would condemn this one: 8.75% free, but 700 GiB is
+        // nobody's emergency. The ceiling is what keeps a big archive quiet.
+        assert_eq!(free_space_level(700 * GIB, 8 * TIB), 0);
+
+        // Low: under the absolute floor even though the share looks healthy.
+        assert_eq!(free_space_level(12 * GIB, 64 * GIB), 1);
+        assert_eq!(free_space_level(200 * GIB, 8 * TIB), 1);
+
+        // Critical.
+        assert_eq!(free_space_level(5 * GIB, 64 * GIB), 2); // 7.8%
+        assert_eq!(free_space_level(50 * GIB, TIB), 2); // 5%
+        assert_eq!(free_space_level(100 * GIB, 8 * TIB), 2); // under the ceiling
+        // The floor catches what no share would: a large disk with nothing
+        // left is critical however small the fraction looks.
+        assert_eq!(free_space_level(3 * GIB, 500 * GIB), 2);
+
+        // Unmeasurable volume: no capacity, so nothing to warn about.
+        assert_eq!(free_space_level(0, 0), 0);
+    }
+
+    #[test]
+    fn a_capacity_pair_shares_one_unit_so_the_two_figures_compare() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        const TIB: u64 = 1024 * GIB;
+
+        // Both figures in the total's unit — calling `format_size` twice would
+        // have picked a unit per number.
+        assert_eq!(
+            format_used_total(26 * GIB, 64 * GIB, Lang::En),
+            "26.0 / 64.0 GB"
+        );
+        assert_eq!(
+            format_used_total(26 * GIB, 64 * GIB, Lang::Fr),
+            "26,0 / 64,0 Go"
+        );
+
+        // A barely used volume keeps the total's unit and reads near zero,
+        // which is what it means. No special case is needed now that the
+        // figure counts UP alongside the bar instead of down against it.
+        assert_eq!(
+            format_used_total(900 * MIB, 2 * TIB, Lang::En),
+            "0.0 / 2.0 TB"
+        );
+
+        // Kept honest against the size column: same base-1024 convention, so a
+        // drive sold as "64 GB" reads the same here as everywhere else.
+        assert_eq!(format_size(64_000_000_000, Lang::En), "59.6 GB");
+        assert_eq!(
+            format_used_total(32_000_000_000, 64_000_000_000, Lang::En),
+            "29.8 / 59.6 GB"
+        );
+
+        // Tiny volume: bytes carry no decimal.
+        assert_eq!(format_used_total(200, 900, Lang::En), "200 / 900 B");
     }
 
     #[test]

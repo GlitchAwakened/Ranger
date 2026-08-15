@@ -60,6 +60,19 @@ export struct SidebarPlace {
     removable: bool,
     // Eject/disconnect target (Linux device `/dev/…` or drive letter `X:`).
     device: string,
+    // Remaining-space level of a drive: -1 unmeasurable (no badge at all),
+    // 0 roomy, 1 low, 2 critical. Anything that is not a local volume — a
+    // share, the trash, a shortcut — stays at -1.
+    space-level: int,
+    // Share of the volume in USE, 0..1. The gauge grows with it, in step with
+    // the figures beside it.
+    space-used-ratio: float,
+    // "26,0/57,3 Go", already localized, and the used figure alone for a
+    // narrow sidebar.
+    space-text: string,
+    space-text-short: string,
+    // One-line breakdown for the hover hint, where each figure is named.
+    space-hint: string,
 }
 
 // A FLATTENED node of the favorites tree. `is-container` distinguishes a
@@ -676,20 +689,27 @@ global Theme {
     // grey, outline the large file area without darkening its surface.
     out property <color> surface:    root.dark ? #2a3242 : #f8fafc;
     // Light "chrome": activity rail + sidebar + view's top toolbar
-    // (tabs + navigation). Its very light grey softly outlines the cards
-    // and stays consistent with the near-white view.
-    out property <color> toolbar:    root.dark ? #222a39 : #eef2f7;
-    // Alternate background (hovers, bullets, headers). Light: very light blue
-    // (accent hue) → hover visible on the chrome AND on the white cards.
-    out property <color> alternate-background: root.dark ? #3a455c : #d9e2f0;
+    // (tabs + navigation). Deliberately a real step below the card rather
+    // than a near-identical shade — at 1.07:1 the two read as one surface and
+    // the layout had no edges of its own. Now 1.28:1, with roughly three
+    // times the blue chroma so the chrome is coloured and the reading area
+    // stays neutral.
+    out property <color> toolbar:    root.dark ? #222a39 : #E9EEF5;
+    // Alternate background (hovers, bullets, headers). Kept BELOW the chrome
+    // it sits on: a hover lighter than the sidebar would brighten there while
+    // darkening on the file rows, the same gesture reading two ways. Visible
+    // on both (1.22:1 over the chrome, 1.56:1 over the card).
+    out property <color> alternate-background: root.dark ? #3a455c : #E9EEF5;
     // Text — bright snow (dark) / deep slate (light) = strong contrast.
     out property <color> foreground: root.dark ? #eceff4 : #202733;
     // Borders / hairlines — define the edges (the crisp relief gives the light theme its
     // clear readability, all the more necessary with light surfaces).
     out property <color> border: root.dark ? #46536e : #ccd6e4;
-    // Accent and its associated text. In light theme, the saturated azure blue stays crisp on
-    // the near-white surfaces and pairs with white text.
-    out property <color> accent-background: root.dark ? #7ccbe1 : #2f74cc;
+    // Accent and its associated text. Deepened along with the chrome: it
+    // carries the drive icons INSIDE the sidebar, and the previous azure was
+    // already under the 4.5:1 floor there (4.16:1) before the chrome moved.
+    // Now 5.84:1 on the chrome and 4.79:1 on a hovered row.
+    out property <color> accent-background: root.dark ? #7ccbe1 : #1f5292;
     out property <color> accent-foreground: root.dark ? #1b2230 : #ffffff;
 }
 
@@ -740,6 +760,47 @@ global Tokens {
     // Text color for the age, based on the hot→cold bucket (0 = recent
     // … 6 = old). Hues stable across both themes; the pill background reuses
     // this color with a low alpha to keep the age scale unobtrusive.
+    // Empty part of a gauge. Alpha-based so it tracks whatever surface it sits
+    // on, and light enough that the filled part reads as the figure.
+    out property <color> track: Theme.dark
+        ? Theme.foreground.with-alpha(0.12)
+        : #C0C8CD;
+
+    // Fill of a drive's capacity gauge, by remaining-space level
+    // (0 roomy · 1 low · 2 critical).
+    //
+    // Level 0 is deliberately colourless. A sidebar of five drives would
+    // otherwise carry five saturated bars competing for attention with the
+    // file list, and the one drive that IS running out would no longer stand
+    // out among them. Colour is spent only where it means something.
+    //
+    // The warning hues are lifted straight from `warning`/`danger`, and the
+    // light theme takes them much softer: these sit UNDER text, the reverse of
+    // their usual role, and on a pale surface the same alpha that reads as
+    // discreet on a dark one comes out heavy. A gauge is ambient information —
+    // it should be legible at a glance and invisible the rest of the time.
+    //
+    // Alphas over the light toolbar (#eef2f7), against a 0.12 track:
+    //   level 0  0.22 → #c0c5cc, twenty-odd levels below the track: present,
+    //                   not a slab
+    //   warning  0.42 → #e1c29a wash
+    //   danger   0.42 → #dab5bc wash
+    // The dark theme is unchanged; it was not the one at fault.
+    public pure function disk-fill(level: int) -> color {
+        level >= 2 ? (Theme.dark ? #d08d92 : root.danger.with-alpha(0.42))
+            : level == 1 ? (Theme.dark ? root.warning : root.warning.with-alpha(0.42))
+            : (Theme.dark ? Theme.foreground.with-alpha(0.30) : #A3ADB5);
+    }
+
+    // Ink for the part of the label that crosses the fill. On a colourless
+    // fill it stays the ordinary text colour, so no seam shows; on a warning
+    // fill in the dark theme the band is bright and takes dark ink instead.
+    public pure function disk-ink(level: int) -> color {
+        Theme.dark
+            ? (level <= 0 ? Theme.foreground : Theme.background)
+            : Theme.foreground;
+    }
+
     public pure function age-color(bucket: int) -> color {
         bucket <= 0 ? (Theme.dark ? #f0786a : #c0392b)   // < 1h warm red
             : bucket == 1 ? (Theme.dark ? #ef9a4f : #b06317) // < 6h orange
@@ -2142,7 +2203,9 @@ component TabItem inherits Rectangle {
 
     height: root.vertical ? root.tab-width : 26px;
     width: root.vertical ? root.cross-len : root.tab-width;
-    border-radius: 6px;
+    // 15% of the 26px tab height. At 6px (23%) the corners read as a pill;
+    // this keeps the shape a rectangle that happens to be softened.
+    border-radius: 5px;
     opacity: dragging ? 0.5 : 1.0;
     // Clean tab bar: the ACTIVE tab is filled/accented, inactive ones
     // fade out (transparent) and only reveal themselves on hover → clear hierarchy.
@@ -3056,6 +3119,10 @@ component PanelComponent inherits Rectangle {
     in-out property <string> url-edit-text;
     // URL menu open? → prevents exiting edit mode on focus loss.
     in property <bool> url-menu-open;
+    /// Bumped by the URL menu's "Copy". The field itself watches this and
+    /// copies, because only IT knows what is selected — see `url-input`.
+    in property <int> url-copy-serial;
+    in property <int> url-paste-serial;
 
     // Rubber-band (selection rectangle).
     // To stay correct while the list is scrolled, the anchor and the current
@@ -3738,7 +3805,44 @@ component PanelComponent inherits Rectangle {
                         selection-foreground-color: Theme.foreground;
                         // Focus + select the WHOLE path (direct replacement
                         // on click; desired default behavior).
-                        init => { self.focus(); self.set-selection-offsets(0, 99999); }
+                        init => {
+                            self.focus();
+                            self.set-selection-offsets(0, 99999);
+                            self.copy-seen = root.url-copy-serial;
+                            self.paste-seen = root.url-paste-serial;
+                        }
+                        // "Copy" in the URL menu acts on the SELECTION, like
+                        // this field's own Ctrl+C — copying the whole path
+                        // whatever was highlighted made selecting part of it
+                        // pointless. Only the field knows its selection, and
+                        // the menu lives at window level, out of reach of it;
+                        // the menu therefore bumps a counter and the field
+                        // acts on it. Same broadcast idiom as `Dismiss`.
+                        //
+                        // The snapshot taken on `init` is what keeps entering
+                        // edit mode from copying on its own: only a counter
+                        // that moved AFTER this field appeared is a request.
+                        property <int> copy-seen;
+                        property <int> copy-request: root.url-copy-serial;
+                        changed copy-request => {
+                            if (self.copy-request > self.copy-seen) {
+                                self.copy-seen = self.copy-request;
+                                self.copy();
+                            }
+                        }
+                        // Same reasoning for "Paste": handing the clipboard to
+                        // the field through its text replaced the whole line,
+                        // where the toolkit's own paste drops it at the caret
+                        // and replaces just the selection — what every text
+                        // field does, and what Ctrl+V here already did.
+                        property <int> paste-seen;
+                        property <int> paste-request: root.url-paste-serial;
+                        changed paste-request => {
+                            if (self.paste-request > self.paste-seen) {
+                                self.paste-seen = self.paste-request;
+                                self.paste();
+                            }
+                        }
                         // Focus loss → exits edit mode without navigating
                         // ("cancel on blur"). BUT not if the URL menu is
                         // open (right-click → menu): we must stay in edit mode
@@ -5506,6 +5610,85 @@ component ProgressToast inherits Rectangle {
 
 // "Places" sidebar ----------
 
+// Capacity gauge shown at the right end of a drive row.
+//
+// Fill and figures both measure what is USED, so they say one thing: the bar
+// grows, the number grows, the volume is filling. Showing free space here was
+// tried and read as a contradiction — a bar advancing while its own caption
+// counted down. Free space is what the reader usually wants, so it leads the
+// hover hint, where there is room to name it.
+//
+// The label straddles the seam between fill and empty track — a two-tone
+// ground no single text colour survives once the fill is coloured. It is
+// therefore drawn TWICE at the very same position, the second pass clipped to
+// the fill. Each half is then read against one flat colour, and the glyph
+// crossing the seam splits exactly where the bar ends. When the fill is
+// colourless both passes use the same ink, so nothing shows.
+//
+// No animation: a value that moves by a fraction of a percent per minute has
+// nothing to animate, and a sliding bar here would read as a copy in progress.
+component DriveGauge inherits Rectangle {
+    in property <float> used-ratio;
+    in property <int> level;
+    in property <string> label;     // "" renders the bare gauge
+    in property <length> avail-width;
+
+    // Floored so a nearly empty volume still shows a sliver rather than an
+    // apparently broken gauge, and capped short of the full width so the
+    // remaining track stays visible on a nearly full one — the two ends are
+    // where the reading matters most.
+    property <length> fill-w: root.used-ratio <= 0
+        ? 0px
+        : min(root.width, max(8px, root.width * clamp(root.used-ratio, 0, 1)));
+
+    height: 18px;
+    // A true capsule. `Tokens.radius-row` is already the radius of the row
+    // highlight sitting behind it; repeating it would read as a misalignment.
+    border-radius: self.height / 2;
+    // Measured text plus air, never wider than the row can spare, never so
+    // narrow the capsule stops reading as a gauge.
+    width: clamp(txt.preferred-width + 16px, 28px, root.avail-width);
+    background: Tokens.track;
+    clip: true;
+
+    Rectangle {
+        x: 0;
+        width: root.fill-w;
+        height: parent.height;
+        background: Tokens.disk-fill(root.level);
+    }
+
+    // Pass 1 — the whole label, over the empty track.
+    txt := Text {
+        x: (parent.width - self.width) / 2;
+        height: parent.height;
+        text: root.label;
+        font-size: 10.5px;
+        font-weight: 400;
+        color: Theme.foreground;
+        vertical-alignment: center;
+    }
+
+    // Pass 2 — same label, same box, clipped to the fill. Centring on the
+    // GAUGE and not on this clip rectangle is what keeps the two passes in
+    // register to the pixel; any drift would show as a doubled edge.
+    Rectangle {
+        x: 0;
+        width: root.fill-w;
+        height: parent.height;
+        clip: true;
+        Text {
+            x: (root.width - self.width) / 2;
+            height: parent.height;
+            text: root.label;
+            font-size: 10.5px;
+            font-weight: 400;
+            color: Tokens.disk-ink(root.level);
+            vertical-alignment: center;
+        }
+    }
+}
+
 // A clickable sidebar entry (icon + label).
 component SidebarItem inherits Rectangle {
     callback clicked();
@@ -5513,9 +5696,47 @@ component SidebarItem inherits Rectangle {
     callback right-clicked(length, length);   // absolute position
     in property <string> label;
     in property <int> kind;   // 0 folder · 1 home · 2 drive · 3 trash · 4 network · 5 phone
+    in property <int> space-level: -1;   // -1 = unmeasurable → no gauge at all
+    in property <float> space-used-ratio;
+    in property <string> space-text;
+    in property <string> space-text-short;
+    in property <string> space-hint;
+    /// Width of the whole side panel, handed down rather than measured.
+    ///
+    /// The gauge sizes itself to its text, so it FEEDS the row's layout. Were
+    /// its content chosen from the row's resolved width, that width would
+    /// depend on the gauge and the gauge on the width — a binding loop the
+    /// compiler rejects outright. The panel width is set by the user and
+    /// depends on nothing below it, which breaks the cycle at the source.
+    in property <length> panel-width;
+
+    // The row trades detail for room as the panel narrows: full figures, then
+    // free space alone — the bar already carries the ratio, so the total is
+    // the one redundant part — then the bare gauge, which still shows the
+    // proportion and the warning colour.
+    //
+    // Fixed costs per row: 12px of section padding, then 8 padding + 16 icon +
+    // 9 + 9 spacing + 8 padding = 50px of row chrome. The thresholds keep at
+    // least 64px for the drive's name, because a row that says how full a disk
+    // is but no longer says WHICH disk has traded away the wrong thing.
+    property <int> space-tier: root.panel-width >= 185px ? 2
+        : root.panel-width >= 170px ? 1
+        : 0;
+
+    // Below the narrowest tier the gauge is dropped entirely rather than shown
+    // bare. A capsule with no figures still costs 28px of a row that has none
+    // to spare, and it says only what the row could no longer name — the
+    // drive's own label matters more than how full it is.
+    property <bool> show-gauge: root.space-level >= 0 && root.space-tier > 0;
+
     height: 30px;
     border-radius: Tokens.radius-row;
-    background: touch.has-hover ? Theme.alternate-background : transparent;
+    // Both areas count: the gauge's sits on top of the row's, so over the
+    // gauge only IT reports hover — without this the row would lose its
+    // highlight exactly where the pointer is.
+    background: (touch.has-hover || gauge-hover.has-hover)
+        ? Theme.alternate-background
+        : transparent;
     HorizontalLayout {
         padding-left: 8px;
         padding-right: 8px;
@@ -5549,25 +5770,97 @@ component SidebarItem inherits Rectangle {
             overflow: elide;
             horizontal-stretch: 1;
         }
+        // Capacity gauge, local volumes only and only when the size could
+        // actually be read. Declared inside the SAME layout so it costs no
+        // extra height.
+        //
+        // ALWAYS instantiated, collapsed to nothing when there is no capacity
+        // to show, rather than wrapped in an `if`: a conditional element is
+        // out of scope for the row, which needs its position to tell whether
+        // the pointer is over it. Zero width and hidden is the same
+        // "instantiate and collapse" idiom the Favorites tree uses.
+        gauge-slot := Rectangle {
+            width: root.show-gauge ? gauge.width : 0px;
+            visible: root.show-gauge;
+            // Full-height slot → vertically centred gauge, same reason as the
+            // icon above: the layout would otherwise pin it to the top.
+            height: parent.height;
+            gauge := DriveGauge {
+                y: (parent.height - self.height) / 2;
+                used-ratio: root.space-used-ratio;
+                level: root.space-level;
+                avail-width: max(28px, root.panel-width - 126px);
+                label: root.space-tier == 2 ? root.space-text : root.space-text-short;
+            }
+        }
     }
+    // Button handling for the row, shared by the two touch areas below so that
+    // clicking the gauge behaves exactly like clicking anywhere else on the
+    // row — one implementation, not a copy that can drift.
+    function dispatch-pointer(ev: PointerEvent, abs-x: length, abs-y: length) {
+        // LEFT click on the sidebar closes menus; right-click (drive/
+        // trash menu) does not bump → it can teleport the menu.
+        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+            Dismiss.serial += 1;
+        }
+        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+            root.right-clicked(abs-x, abs-y);
+        }
+        // Middle-click → open the target in a NEW tab (active view).
+        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.middle) {
+            root.middle-clicked();
+        }
+    }
+
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
         pointer-event(ev) => {
-            // LEFT click on the sidebar closes menus; right-click (drive/
-            // trash menu) does not bump → it can teleport the menu.
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) { Dismiss.serial += 1; }
-            if (ev.kind == PointerEventKind.down
-                    && ev.button == PointerEventButton.right) {
-                root.right-clicked(
-                    self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y);
+            root.dispatch-pointer(ev,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y);
+        }
+    }
+
+    // Hover target for the gauge, and the gauge only.
+    //
+    // Declared AFTER `touch` so it sits ON TOP of it and is the one the
+    // pointer reaches — the same front-to-back rule the Favorites tree relies
+    // on. It hands every button straight back to the row, so nothing is lost
+    // by covering it.
+    //
+    // This replaces an earlier attempt that compared the row's `mouse-x`
+    // against the gauge's position. That looked cheaper but was unreliable:
+    // entering the gauge did not raise the hint, moving on to another row did,
+    // and leaving the gauge sideways left it up — the pointer coordinate is
+    // simply not dependable at the moment hovering begins. A real touch area
+    // has one honest state, `has-hover`, and Slint maintains it. Zero width
+    // when there is no gauge, so it cannot intercept anything.
+    gauge-hover := TouchArea {
+        x: gauge-slot.x;
+        y: 0;
+        width: root.show-gauge ? gauge-slot.width : 0px;
+        height: parent.height;
+        mouse-cursor: pointer;
+        // Names each figure, which the gauge alone cannot: "26,0/57,3 Go" does
+        // not say which number is which. `absolute-position` is read HERE, in
+        // an event handler where the layout has settled — reading it from a
+        // property derived from the geometry aborted the whole window with
+        // "Recursion detected", the row being inside a ScrollView.
+        changed has-hover => {
+            if (self.has-hover && root.space-hint != "") {
+                Tip.text = root.space-hint;
+                Tip.x = self.absolute-position.x;
+                Tip.y = self.absolute-position.y + self.height + 4px;
+            } else if (Tip.text == root.space-hint) {
+                Tip.text = "";
             }
-            // Middle-click → open the target in a NEW tab (active view).
-            if (ev.kind == PointerEventKind.down
-                    && ev.button == PointerEventButton.middle) {
-                root.middle-clicked();
-            }
+        }
+        clicked => { root.clicked(); }
+        pointer-event(ev) => {
+            root.dispatch-pointer(ev,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y);
         }
     }
 }
@@ -5766,6 +6059,8 @@ component Sidebar inherits Rectangle {
     in property <bool> header-visible: true;
     in property <bool> reorder-drag-active: false;
     in property <int> reorder-drag-source: -1;
+    /// Width of the side panel, forwarded to the rows — see `SidebarItem`.
+    in property <length> panel-width;
     callback place-clicked(string, int);   // (path, kind)
     callback place-middle-clicked(string, int);   // (path, kind) → new tab
     callback place-right-clicked(string, int, bool, string, length, length);   // (path, kind, removable, device, x, y)
@@ -5821,6 +6116,12 @@ component Sidebar inherits Rectangle {
                             : (p.kind == 2 && p.label == "") ? root.strings.sidebar-root
                             : p.label;
                         kind: p.kind;
+                        space-level: p.space-level;
+                        space-used-ratio: p.space-used-ratio;
+                        space-text: p.space-text;
+                        space-text-short: p.space-text-short;
+                        space-hint: p.space-hint;
+                        panel-width: root.panel-width;
                         clicked => { root.place-clicked(p.path, p.kind); }
                         middle-clicked => { root.place-middle-clicked(p.path, p.kind); }
                         right-clicked(x, y) => { root.place-right-clicked(p.path, p.kind, p.removable, p.device, x, y); }
@@ -6553,13 +6854,16 @@ export component MainWindow inherits Window {
 
     // URL bar menu (right-click): Paste / Copy path.
     in-out property <bool> url-menu-open: false;
+    /// Bumped by the menu's "Copy"; the URL field watches it and copies its
+    /// own selection. A callback could not do this: the field is inside a
+    /// panel, and only it knows what is highlighted.
+    in-out property <int> url-copy-serial: 0;
+    in-out property <int> url-paste-serial: 0;
     in-out property <length> url-menu-x;
     in-out property <length> url-menu-y;
     // EDITABLE text of the URL bar (shared: only one panel in edit mode at
     // a time). Lets the bridge paste the clipboard into it without submitting.
     in-out property <string> url-edit-text;
-    callback url-paste();   // pastes the clipboard's path INTO the field
-    callback url-copy();    // copies the current path to the clipboard
 
     // ----- Column widths: PER PANEL (carried by each PanelView).
     //       A header resize reports here with the panel's index. -----
@@ -7904,6 +8208,9 @@ export component MainWindow inherits Window {
                             col: 0;
                             places: root.sidebar-places-drives;
                             strings: root.strings;
+                            // Only this section carries capacity gauges, so it
+                            // is the only one that needs the panel's width.
+                            panel-width: root.sidebar-width;
                             section-code: 0;
                             title: root.strings.sidebar-drives;
                             collapsed: root.sidebar-drives-collapsed;
@@ -8295,6 +8602,8 @@ export component MainWindow inherits Window {
                     close-ctx-menu => { root.close-ctx-menus(); }
                     url-edit-text <=> root.url-edit-text;
                     url-menu-open: root.url-menu-open;
+                    url-copy-serial: root.url-copy-serial;
+                    url-paste-serial: root.url-paste-serial;
 
                     activate => { root.panel-clicked(idx); }
                     go-back => { root.go-back(); }
@@ -8728,11 +9037,11 @@ export component MainWindow inherits Window {
                 spacing: 0px;
                 MenuItem {
                     label: root.strings.ctx-copy;     // "Copy"
-                    clicked => { root.url-menu-open = false; root.url-copy(); }
+                    clicked => { root.url-menu-open = false; root.url-copy-serial += 1; }
                 }
                 MenuItem {
                     label: root.strings.ctx-paste;    // "Paste"
-                    clicked => { root.url-menu-open = false; root.url-paste(); }
+                    clicked => { root.url-menu-open = false; root.url-paste-serial += 1; }
                 }
             }
         }

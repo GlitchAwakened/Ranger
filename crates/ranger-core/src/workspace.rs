@@ -45,6 +45,15 @@ pub struct TabState {
     /// default value is "folders first".
     #[serde(default = "default_group_mode")]
     pub group_mode: GroupMode,
+    /// Thumbnail/row zoom level for this tab (Ctrl+wheel).
+    ///
+    /// `None` when the field is absent, which is what every workspace saved
+    /// before this was persisted looks like. The caller then derives a level
+    /// from `preview`, so an older file reopens exactly as it used to instead
+    /// of snapping to a zoom it never chose. The valid range belongs to the
+    /// interface, which clamps on restore — the core only carries the value.
+    #[serde(default)]
+    pub zoom: Option<i32>,
 }
 
 fn default_group_mode() -> GroupMode {
@@ -205,6 +214,7 @@ impl WorkspaceState {
                     preview: false,
                     show_hidden: false,
                     group_mode: GroupMode::FoldersFirst,
+                    zoom: None,
                 }],
                 columns: crate::columns::default_columns(),
                 tab_bar_mode: 0,
@@ -463,6 +473,7 @@ mod tests {
                         preview: false,
                         show_hidden: false,
                         group_mode: GroupMode::FoldersFirst,
+                        zoom: None,
                     }],
                     columns: crate::columns::default_columns(),
                     tab_bar_mode: 0,
@@ -479,6 +490,7 @@ mod tests {
                             preview: true,
                             show_hidden: false,
                             group_mode: GroupMode::FoldersFirst,
+                            zoom: None,
                         },
                         TabState {
                             path: "/etc".into(),
@@ -487,6 +499,7 @@ mod tests {
                             preview: false,
                             show_hidden: false,
                             group_mode: GroupMode::FoldersFirst,
+                            zoom: None,
                         },
                     ],
                     columns: crate::columns::default_columns(),
@@ -510,6 +523,37 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_saved_before_the_zoom_existed_still_loads() {
+        // Exactly what older files contain: a tab with no `zoom` key at all.
+        // It must parse, and the absence has to stay distinguishable from a
+        // stored level so the interface can fall back to the default for the
+        // mode instead of snapping the view to some arbitrary size.
+        let older = r#"
+            active_panel = 0
+            [[panels]]
+            stretch = 1.0
+            active_tab = 0
+            [[panels.tabs]]
+            path = "/tmp"
+            sort_column = "name"
+            sort_order = "asc"
+            preview = true
+            show_hidden = false
+            group_mode = "foldersfirst"
+        "#;
+        let ws: WorkspaceState = toml::from_str(older).unwrap();
+        assert_eq!(ws.panels[0].tabs[0].zoom, None);
+        assert!(ws.panels[0].tabs[0].preview);
+
+        // A file written today keeps the level through a full round trip.
+        let mut current = ws.clone();
+        current.panels[0].tabs[0].zoom = Some(5);
+        let text = toml::to_string_pretty(&current).unwrap();
+        let back: WorkspaceState = toml::from_str(&text).unwrap();
+        assert_eq!(back.panels[0].tabs[0].zoom, Some(5));
+    }
+
+    #[test]
     fn closed_tabs_are_backward_compatible_persisted_and_capped() {
         let serialized_without_history = toml::to_string_pretty(&sample()).unwrap();
         assert!(!serialized_without_history.contains("closed_tabs"));
@@ -525,6 +569,7 @@ mod tests {
                 preview: false,
                 show_hidden: false,
                 group_mode: GroupMode::FoldersFirst,
+                zoom: None,
             })
             .collect();
 
@@ -636,6 +681,7 @@ mod tests {
                     preview: false,
                     show_hidden: false,
                     group_mode: GroupMode::FoldersFirst,
+                    zoom: None,
                 }],
                 columns: crate::columns::default_columns(),
                 tab_bar_mode: 0,
@@ -675,6 +721,7 @@ mod tests {
                         preview: false,
                         show_hidden: false,
                         group_mode: GroupMode::FoldersFirst,
+                        zoom: None,
                     }],
                     columns: crate::columns::default_columns(),
                     tab_bar_mode: 0,
@@ -744,6 +791,7 @@ mod tests {
                     preview: false,
                     show_hidden: false,
                     group_mode: GroupMode::FoldersFirst,
+                    zoom: None,
                 }],
                 columns: crate::columns::default_columns(),
                 tab_bar_mode: 0,
