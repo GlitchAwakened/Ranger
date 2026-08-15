@@ -3058,7 +3058,7 @@ component PanelComponent inherits Rectangle {
     callback refresh();
     callback sort-clicked(string);
     callback row-activated(int);
-    callback row-clicked(int);
+    callback row-clicked(int) -> bool;
     callback row-ctrl-clicked(int);
     callback row-shift-clicked(int);
     // Slow second click on the single selected entry: reuses the
@@ -4559,13 +4559,21 @@ component PanelComponent inherits Rectangle {
                             } else if (ev.modifiers.shift) {
                                 root.row-shift-clicked(idx);
                             } else {
-                                root.row-clicked(idx);
+                                // The callback reports whether this row was
+                                // ALREADY the entire selection. A click that
+                                // collapses a multiple selection onto one entry
+                                // is the user DROPPING the others, not asking to
+                                // rename what they kept — and on the clicked row
+                                // alone the two are indistinguishable, since it
+                                // was selected before and after.
+                                let was-sole-selection: bool = root.row-clicked(idx);
                                 // A first click selects. Only a following click
                                 // on this already-selected entry arms the popup.
                                 // The Timer will still check hover, identity, and state.
                                 if (!self.activation-cooldown
                                         && self.down-view-was-active
                                         && !self.down-overlay-was-open
+                                        && was-sole-selection
                                         && self.down-was-selected && idx == self.down-idx) {
                                     self.rename-candidate-idx = idx;
                                     self.rename-candidate-dir = root.view.current-path;
@@ -6955,7 +6963,7 @@ export component MainWindow inherits Window {
     callback refresh();
     callback sort-clicked(string);
     callback row-activated(int);
-    callback row-clicked(int);
+    callback row-clicked(int) -> bool;
     callback row-ctrl-clicked(int);
     callback row-shift-clicked(int);
     callback select-all();
@@ -8613,7 +8621,7 @@ export component MainWindow inherits Window {
                     refresh => { root.refresh(); }
                     sort-clicked(c) => { root.sort-clicked(c); }
                     row-activated(i) => { root.row-activated(i); }
-                    row-clicked(i) => { root.row-clicked(i); }
+                    row-clicked(i) => { return root.row-clicked(i); }
                     row-ctrl-clicked(i) => { root.row-ctrl-clicked(i); }
                     row-shift-clicked(i) => { root.row-shift-clicked(i); }
                     rename-selected => { root.action-rename(); }

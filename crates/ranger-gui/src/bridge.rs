@@ -2625,12 +2625,17 @@ pub fn install(window: &MainWindow, state: AppState) {
     {
         let st = state.clone();
         let weak = window.as_weak();
-        window.on_row_clicked(move |idx: i32| {
-            let count = selection_set_only(&st.active_rows_model(), idx);
+        // Returns whether the row was ALREADY the whole selection. A click that
+        // shrinks a multiple selection down to one entry must not also arm the
+        // deferred rename: the user is dropping the other entries, not asking
+        // to edit this one's name.
+        window.on_row_clicked(move |idx: i32| -> bool {
+            let (count, was_alone) = selection_set_only(&st.active_rows_model(), idx);
             st.set_selection_anchor(idx);
             if let Some(w) = weak.upgrade() {
                 push_active_footer(&w, &st, count);
             }
+            was_alone
         });
     }
     {
@@ -2801,7 +2806,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 .map(|r| r.selected)
                 .unwrap_or(false);
             if !already_selected {
-                let count = selection_set_only(&rows, idx);
+                let (count, _) = selection_set_only(&rows, idx);
                 st.set_selection_anchor(idx);
                 push_active_footer(&w, &st, count);
             }
@@ -4069,7 +4074,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 if already {
                     None
                 } else {
-                    let count = selection_set_only(&p.rows_model, row_idx);
+                    let (count, _) = selection_set_only(&p.rows_model, row_idx);
                     let active = p.tabs.active;
                     p.tabs.tabs[active].selection_anchor = row_idx;
                     p.tabs.tabs[active].cursor = row_idx;
@@ -13007,8 +13012,15 @@ fn entries_to_rows(
 // the operation, so the caller can push it directly into
 // `selected-count` without recomputing it.
 
-fn selection_set_only<M: slint::Model<Data = FileRow>>(model: &M, idx: i32) -> i32 {
+/// Reduces the selection to `idx` alone. Returns `(count, was_already_alone)`.
+///
+/// The second value is what tells a plain click apart from a click that
+/// COLLAPSES a wider selection. Both look identical on the row that was hit —
+/// it was selected before and it is selected after — so only "did anything
+/// else change" separates them, and the caller cannot see that from outside.
+fn selection_set_only<M: slint::Model<Data = FileRow>>(model: &M, idx: i32) -> (i32, bool) {
     let mut count = 0i32;
+    let mut changed = false;
     let n = model.row_count();
     for i in 0..n {
         if let Some(mut row) = model.row_data(i) {
@@ -13016,13 +13028,14 @@ fn selection_set_only<M: slint::Model<Data = FileRow>>(model: &M, idx: i32) -> i
             if row.selected != should {
                 row.selected = should;
                 model.set_row_data(i, row);
+                changed = true;
             }
             if should {
                 count += 1;
             }
         }
     }
-    count
+    (count, !changed)
 }
 
 fn selection_toggle<M: slint::Model<Data = FileRow>>(model: &M, idx: i32) -> i32 {
@@ -13140,7 +13153,7 @@ fn focus_entry_by_name(window: &MainWindow, state: &AppState, name: &str) {
     let Some(idx) = idx.map(|i| i as i32) else {
         return;
     };
-    let count = selection_set_only(&model, idx);
+    let (count, _) = selection_set_only(&model, idx);
     state.with_tabs_mut(|b| {
         let a = b.active;
         let t = &mut b.tabs[a];
@@ -15257,6 +15270,43 @@ mod tests {
             snapshot_selection(&model),
             vec![false, true, false, false, false, false, false, true]
         );
+    }
+
+    #[test]
+    fn collapsing_a_multiple_selection_is_told_apart_from_re_clicking_one_row() {
+        // The distinction the deferred rename hangs on. On the clicked row the
+        // two cases look identical — selected before, selected after — so only
+        // "did anything else change" separates them.
+        let rows: Vec<FileRow> = (0..5)
+            .map(|index| FileRow {
+                selected: matches!(index, 1..=3),
+                ..Default::default()
+            })
+            .collect();
+        let model = VecModel::from(rows);
+
+        // Clicking one member of a multiple selection DROPS the others: the
+        // user is narrowing down, not asking to edit a name.
+        let (count, was_alone) = selection_set_only(&model, 2);
+        assert_eq!(count, 1);
+        assert!(
+            !was_alone,
+            "the click removed rows 1 and 3 from the selection"
+        );
+        assert_eq!(
+            snapshot_selection(&model),
+            vec![false, false, true, false, false]
+        );
+
+        // Clicking it AGAIN changes nothing — that is the second click Explorer
+        // treats as "rename this".
+        let (count, was_alone) = selection_set_only(&model, 2);
+        assert_eq!(count, 1);
+        assert!(was_alone);
+
+        // And clicking a different, unselected row is a plain new selection.
+        let (_, was_alone) = selection_set_only(&model, 4);
+        assert!(!was_alone);
     }
 
     #[test]
