@@ -1,6 +1,6 @@
-# Coming from Ranger?
+# Used Ranger before? Get your workspaces back in Favnyr.
 
-Favnyr was previously named Ranger, renamed to avoid a name clash with an unrelated, [well-established terminal file manager](https://github.com/ranger/ranger).
+Ranger is now Favnyr, renamed to avoid a name clash with an unrelated, [well-established terminal file manager](https://github.com/ranger/ranger).
 
 Settings, favourites, workspaces and custom commands are plain files in a per-user folder named after the app, so the new version starts with none of them.
 
